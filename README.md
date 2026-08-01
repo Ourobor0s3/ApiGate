@@ -2,6 +2,10 @@
 
 API Gateway in Go. Proxies `/weather` and `/news` to external APIs, caches GET responses in Redis, rate-limits per-IP with a sliding window, and serves an aggregated `/dashboard` with a web UI.
 
+## Screenshot
+
+![ApiGate Dashboard](docs/dashboard.png)
+
 ## Quick start
 
 Prerequisites: Go 1.22+ and a running Redis on `localhost:6379`.
@@ -24,6 +28,17 @@ secrets loaded from Redis: [NEWS_API_KEY WEATHER_LOCATION MAIN_CURRENCY]
 ```
 
 Persistence files (`dump.rdb`, `appendonlydir/`) are written to the repo root and gitignored — never commit them.
+
+## Data sources
+
+| Card | Source | Key required |
+| --- | --- | --- |
+| Weather | [open-meteo](https://open-meteo.com) (`api.open-meteo.com`) | No |
+| Place name | [BigDataCloud](https://www.bigdatacloud.com) reverse-geocoding | No |
+| News | [NewsAPI](https://newsapi.org) (`newsapi.org/v2/top-headlines`) | Yes (`NEWS_API_KEY`) |
+| Currency rates | [ExchangeRate-API](https://www.exchangerate-api.com) (`api.exchangerate-api.com/v4/latest/<base>`) | No |
+
+Weather and news URLs are overridable via env vars; the place-name and rates URLs are hardcoded. Rates are fetched live per dashboard request (the `/dashboard` page is never cached).
 
 ## Getting an API key
 
@@ -50,10 +65,9 @@ In the **🔑 API Secrets** card, the **Name** field selects a setting and the *
 Example: to show Moscow weather, enter `WEATHER_LOCATION` in the Name field and `55.75,37.62` in the Value field, then click **Save**.
 
 Notes:
-- Values are stored in Redis and applied on the next request — no restart needed.
-- Values are **never shown back** by the UI or the API, only names are listed.
+- Values are **never shown back** — the UI and API list only names.
 - A name must match `[A-Za-z0-9_-]+`; an invalid `WEATHER_LOCATION` falls back to the default.
-- All three can also be set via env vars of the same name (Redis value wins).
+- Each setting can also be provided via an env var of the same name; the Redis value wins.
 - Data persists across restarts (see [Restarting the server keeps your secrets](#restarting-the-server-keeps-your-secrets)).
 
 ## Configuration (env vars)
@@ -81,7 +95,7 @@ Notes:
 - `internal/proxy` — `httputil.ReverseProxy` per route; appends `apiKey` to `/news` from the secret store if missing.
 - `internal/cache` — GET-only; custom binary serialization (2-byte status + headers + body), per-route TTLs.
 - `internal/ratelimit` — sliding window over a Redis ZSET per IP (`X-Forwarded-For` first value, else `RemoteAddr`).
-- `internal/aggregation` — `/dashboard` fans out 3 upstream fetches under a 10s timeout.
+- `internal/aggregation` — `/dashboard` fans out 4 upstream fetches (weather, reverse-geocoded place name, news, rates) under a 10s timeout, resolving settings per request.
 - `internal/secrets` — Redis-backed key store (`secret:<name>`).
 
 ## Development

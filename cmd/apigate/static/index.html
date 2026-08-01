@@ -5,109 +5,200 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ApiGate Dashboard</title>
 <style>
-  :root { --bg:#0f172a; --card:#1e293b; --border:#334155; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --ok:#4ade80; --err:#f87171; }
+  :root {
+    --bg: #0b1220;
+    --bg-glow-1: rgba(56, 189, 248, .07);
+    --bg-glow-2: rgba(129, 140, 248, .06);
+    --card: rgba(148, 163, 184, .06);
+    --card-solid: #111a2c;
+    --border: rgba(148, 163, 184, .14);
+    --border-strong: rgba(148, 163, 184, .28);
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --faint: #64748b;
+    --accent: #38bdf8;
+    --accent-2: #818cf8;
+    --accent-grad: linear-gradient(135deg, #38bdf8, #818cf8);
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --err: #f87171;
+    --radius: 16px;
+    --shadow: 0 10px 30px rgba(2, 6, 23, .45);
+    --shadow-lift: 0 16px 40px rgba(2, 6, 23, .6);
+  }
   * { box-sizing: border-box; }
-  body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 2rem 1rem; }
-  .wrap { max-width: 56rem; margin: 0 auto; }
+  html { color-scheme: dark; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    background:
+      radial-gradient(60rem 30rem at 85% -10%, var(--bg-glow-1), transparent 60%),
+      radial-gradient(50rem 26rem at -10% 110%, var(--bg-glow-2), transparent 55%),
+      var(--bg);
+    color: var(--text);
+    margin: 0;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 60rem; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
 
-  header { display:flex; align-items:center; justify-content:space-between; gap:1rem; flex-wrap:wrap; margin-bottom:1.5rem; }
-  h1 { margin:0; font-size:1.5rem; }
+  header { display:flex; align-items:flex-end; justify-content:space-between; gap:1rem; flex-wrap:wrap; margin-bottom:1rem; }
+  h1 { margin:0; font-size:1.65rem; font-weight:700; letter-spacing:-.02em; }
+  h1 .grad { background:var(--accent-grad); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .subtitle { margin:.3rem 0 0; color:var(--faint); font-size:.9rem; }
   .header-right { display:flex; align-items:center; gap:.75rem; }
 
-  .badge { font-size:.8rem; padding:.25rem .6rem; border-radius:999px; background:var(--border); color:var(--muted); white-space:nowrap; }
-  .badge.loading { background:#3b82f6; color:#fff; animation: pulse 1s infinite; }
-  .badge.ok { background:#14532d; color:var(--ok); }
-  .badge.err { background:#7f1d1d; color:var(--err); }
+  .badge { display:inline-flex; align-items:center; gap:.45rem; font-size:.78rem; font-weight:600; padding:.32rem .7rem; border-radius:999px; background:rgba(148,163,184,.1); color:var(--muted); white-space:nowrap; border:1px solid var(--border); }
+  .badge::before { content:""; width:8px; height:8px; border-radius:50%; background:currentColor; }
+  .badge.loading { color:var(--accent); }
+  .badge.loading::before { animation: blink 1s infinite; }
+  .badge.ok { color:var(--ok); background:rgba(74,222,128,.08); border-color:rgba(74,222,128,.25); }
+  .badge.err { color:var(--err); background:rgba(248,113,113,.08); border-color:rgba(248,113,113,.25); }
+  @keyframes blink { 50% { opacity:.3; } }
 
-  button { font:inherit; display:inline-flex; align-items:center; gap:.5rem; padding:.55rem 1rem; border:none; border-radius:8px; background:var(--accent); color:#062033; font-weight:600; cursor:pointer; }
-  button:hover { filter:brightness(1.1); }
-  button:disabled { opacity:.6; cursor:default; }
-  .spinner { display:none; width:14px; height:14px; border:2px solid rgba(6,32,51,.35); border-top-color:#062033; border-radius:50%; animation:spin .7s linear infinite; }
+  button { font:inherit; display:inline-flex; align-items:center; gap:.5rem; padding:.55rem 1.05rem; border:none; border-radius:10px; background:var(--accent-grad); color:#06121f; font-weight:600; cursor:pointer; transition:transform .12s ease, box-shadow .2s ease, filter .2s ease; box-shadow:0 4px 14px rgba(56,189,248,.25); }
+  button:hover { filter:brightness(1.08); transform:translateY(-1px); box-shadow:0 8px 20px rgba(56,189,248,.32); }
+  button:active { transform:translateY(0); }
+  button:disabled { opacity:.6; cursor:default; transform:none; box-shadow:none; }
+  button:focus-visible, a:focus-visible, input:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .spinner { display:none; width:14px; height:14px; border:2px solid rgba(6,18,31,.35); border-top-color:#06121f; border-radius:50%; animation:spin .7s linear infinite; }
   button.loading .spinner { display:inline-block; }
 
-  .meta { color:var(--muted); font-size:.85rem; margin-bottom:1.5rem; }
+  .meta { color:var(--faint); font-size:.85rem; margin:0 0 1.25rem; display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; }
+  .autorefresh { margin-left:auto; display:inline-flex; align-items:center; gap:.4rem; font-size:.8rem; color:var(--muted); cursor:pointer; user-select:none; }
+  .autorefresh input { position:absolute; opacity:0; width:1px; height:1px; margin:0; clip-path:inset(50%); }
+  .autorefresh input:focus-visible + .toggle { outline:2px solid var(--accent); outline-offset:2px; }
+  .toggle { position:relative; width:34px; height:20px; border-radius:999px; background:var(--border-strong); transition:background .2s; flex:none; }
+  .toggle::after { content:""; position:absolute; top:2px; left:2px; width:16px; height:16px; border-radius:50%; background:#e2e8f0; transition:transform .2s; }
+  input#autoRef:checked + .toggle { background:var(--accent); }
+  input#autoRef:checked + .toggle::after { transform:translateX(14px); }
 
-  .dashboard { display:grid; grid-template-columns: 1fr 2fr; gap:1rem; align-items:start; }
-  .col { display:grid; gap:1rem; }
-  @media (max-width: 720px) { .dashboard { grid-template-columns: 1fr; } }
+  .err-banner { display:flex; align-items:flex-start; gap:.6rem; background:rgba(248,113,113,.1); border:1px solid rgba(248,113,113,.3); color:#fecaca; padding:.8rem 1rem; border-radius:12px; margin-bottom:1.25rem; font-size:.92rem; }
+  .err-banner[hidden] { display:none; }
 
-  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:1.25rem; }
-  .card h2 { margin:0 0 1rem; font-size:1.05rem; color:var(--accent); display:flex; align-items:center; gap:.5rem; }
-  .card .empty { color:var(--muted); font-style:italic; }
-  .stat { display:flex; justify-content:space-between; align-items:baseline; padding:.45rem 0; border-bottom:1px dashed var(--border); }
+  .dashboard { display:grid; grid-template-columns: 1fr 2fr; gap:1.25rem; align-items:start; }
+  .col { display:grid; gap:1.25rem; }
+  @media (max-width: 760px) { .dashboard { grid-template-columns: 1fr; } }
+
+  .card { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:1.35rem 1.4rem; box-shadow:var(--shadow); backdrop-filter:blur(8px); transition:border-color .25s, transform .25s, box-shadow .25s; }
+  .card:hover { border-color:var(--border-strong); }
+  .card h2 { margin:0 0 1rem; font-size:1.02rem; font-weight:600; color:var(--text); display:flex; align-items:center; gap:.5rem; letter-spacing:.01em; }
+  .card h2 .accent { color:var(--accent); }
+  .card .empty { color:var(--muted); font-style:italic; font-size:.92rem; }
+
+  .skeleton { border-radius:8px; background:linear-gradient(90deg, rgba(148,163,184,.08) 25%, rgba(148,163,184,.18) 37%, rgba(148,163,184,.08) 63%); background-size:400% 100%; animation: shimmer 1.3s infinite; }
+  @keyframes shimmer { 0% { background-position:100% 0; } 100% { background-position:0 0; } }
+
+  .fade { animation: fadein .35s ease; }
+  @keyframes fadein { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
+
+  .weather-hero { display:flex; align-items:center; gap:1.1rem; margin-bottom:1rem; }
+  .weather-hero .icon { font-size:2.6rem; line-height:1; filter:drop-shadow(0 2px 8px rgba(56,189,248,.35)); }
+  .weather-hero .temp { font-size:2.4rem; font-weight:700; letter-spacing:-.03em; line-height:1; font-variant-numeric:tabular-nums; }
+  .weather-hero .cond { color:var(--muted); font-size:.92rem; margin-top:.45rem; line-height:1.35; }
+  .stat-grid { display:grid; grid-template-columns:1fr; gap:.2rem 0; }
+  .stat { display:grid; grid-template-columns:auto minmax(0, 1fr); align-items:baseline; column-gap:.9rem; padding:.55rem 0; border-bottom:1px dashed var(--border); font-size:.88rem; line-height:1.4; }
   .stat:last-child { border-bottom:none; }
-  .stat .k { color:var(--muted); font-size:.85rem; }
-  .stat .v { font-size:1.05rem; font-weight:600; }
+  .stat .k { color:var(--muted); white-space:nowrap; }
+  .stat .v { font-weight:600; text-align:right; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-variant-numeric:tabular-nums; }
+
+  .rates-head { display:flex; justify-content:space-between; align-items:baseline; gap:.5rem; margin-bottom:.9rem; font-size:.9rem; color:var(--muted); padding-bottom:.6rem; border-bottom:1px solid var(--border); }
+  .rates-head .base { color:var(--text); font-weight:600; }
+  .rates-head .date { color:var(--faint); font-size:.82rem; font-variant-numeric:tabular-nums; }
+  .rates-grid { display:grid; grid-template-columns:1fr 1fr; gap:.4rem .75rem; }
+  .rate { display:flex; justify-content:space-between; align-items:baseline; gap:.5rem; padding:.55rem .7rem; border-radius:9px; background:rgba(148,163,184,.06); font-size:.9rem; transition:background .15s; }
+  .rate:hover { background:rgba(148,163,184,.11); }
+  .rate .code { color:var(--muted); font-weight:600; letter-spacing:.03em; }
+  .rate .val { font-weight:700; font-variant-numeric:tabular-nums; }
+  @media (max-width: 440px) { .rates-grid { grid-template-columns:1fr; } }
 
   ul.articles { list-style:none; margin:0; padding:0; }
-  ul.articles li { padding:.6rem 0; border-bottom:1px dashed var(--border); }
+  ul.articles li { padding:.7rem .5rem; border-bottom:1px dashed var(--border); border-radius:8px; transition:background .15s; }
   ul.articles li:last-child { border-bottom:none; }
-  ul.articles a { color:var(--accent); text-decoration:none; font-weight:500; }
-  ul.articles a:hover { text-decoration:underline; }
-  ul.articles .src { color:var(--muted); font-size:.8rem; display:block; margin-top:.15rem; }
+  ul.articles li:hover { background:rgba(148,163,184,.05); }
+  ul.articles a { color:var(--text); text-decoration:none; font-weight:500; line-height:1.35; transition:color .15s; }
+  ul.articles a:hover { color:var(--accent); }
+  ul.articles .src { color:var(--faint); font-size:.78rem; display:block; margin-top:.25rem; display:flex; gap:.4rem; align-items:center; }
+  ul.articles .src .dot { width:4px; height:4px; border-radius:50%; background:var(--accent); display:inline-block; }
 
-  .err-banner { background:#7f1d1d; border:1px solid var(--err); color:#fecaca; padding:.75rem 1rem; border-radius:8px; margin-bottom:1rem; }
-
-  input { font:inherit; padding:.55rem .75rem; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--text); }
-  input::placeholder { color:var(--muted); }
-  input:focus { outline:2px solid var(--accent); outline-offset:0; }
-  .form-row { display:flex; gap:.5rem; flex-wrap:wrap; }
+  input { font:inherit; padding:.55rem .8rem; border:1px solid var(--border); border-radius:10px; background:rgba(2,6,23,.5); color:var(--text); transition:border-color .2s, box-shadow .2s; }
+  input::placeholder { color:var(--faint); }
+  input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px rgba(56,189,248,.15); }
+  .form-row { display:flex; gap:.6rem; flex-wrap:wrap; }
+  .form-row input { flex:1 1 10rem; }
+  .form-row input:first-child { flex:1 1 8rem; }
   ul.secrets { list-style:none; margin:1rem 0 0; padding:0; }
-  ul.secrets li { display:flex; justify-content:space-between; align-items:center; gap:.5rem; padding:.45rem 0; border-bottom:1px dashed var(--border); }
+  ul.secrets li { display:flex; justify-content:space-between; align-items:center; gap:.6rem; padding:.5rem .4rem; border-bottom:1px dashed var(--border); font-size:.9rem; }
   ul.secrets li:last-child { border-bottom:none; }
-  button.danger { background:#7f1d1d; color:#fecaca; padding:.35rem .7rem; font-size:.85rem; }
-  .hint { color:var(--muted); font-size:.85rem; margin:0 0 1rem; }
+  ul.secrets code { color:var(--accent); font-family:ui-monospace, "SF Mono", Menlo, monospace; font-size:.85rem; }
+  button.danger { background:rgba(248,113,113,.12); color:var(--err); box-shadow:none; padding:.35rem .75rem; font-size:.82rem; }
+  button.danger:hover { background:rgba(248,113,113,.22); box-shadow:none; }
+  .hint { color:var(--faint); font-size:.85rem; margin:0 0 1rem; line-height:1.5; }
+  .hint code { background:rgba(148,163,184,.12); padding:.1rem .35rem; border-radius:6px; font-size:.8rem; color:var(--text); font-family:ui-monospace, "SF Mono", Menlo, monospace; }
 
+  .section-gap { margin-top:1.25rem; }
+
+  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration:.01ms !important; transition-duration:.01ms !important; } }
   @keyframes spin { to { transform:rotate(360deg); } }
-  @keyframes pulse { 50% { opacity:.55; } }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <h1>ApiGate Dashboard</h1>
+    <div>
+      <h1><span class="grad">ApiGate</span> Dashboard</h1>
+      <p class="subtitle">Aggregated view of the /weather, /news and /rates upstreams, proxied through this gateway.</p>
+    </div>
     <div class="header-right">
       <span id="badge" class="badge loading">loading…</span>
       <button id="refresh">Refresh<span class="spinner"></span></button>
     </div>
   </header>
 
-  <p class="meta" id="meta">Loading data…</p>
-  <div id="errBanner" class="err-banner" hidden></div>
+  <p class="meta">
+    <span id="meta">Loading data…</span>
+    <label class="autorefresh" title="Auto-refresh dashboard every 60s">
+      <input type="checkbox" id="autoRef" checked>
+      <span class="toggle"></span>
+      auto 60s
+    </label>
+  </p>
+  <div id="errBanner" class="err-banner" hidden>
+    <span>⚠️</span><span id="errText"></span>
+  </div>
 
   <div class="dashboard">
     <div class="col">
       <section class="card" id="weatherCard">
-        <h2 id="weatherTitle">🌤️ Weather</h2>
+        <h2><span class="accent">🌤️</span> <span id="weatherTitle">Weather</span></h2>
         <div id="weatherBody" class="empty">Loading…</div>
       </section>
 
       <section class="card" id="ratesCard">
-        <h2>💱 Currency Rates</h2>
+        <h2><span class="accent">💱</span> Currency Rates</h2>
         <div id="ratesBody" class="empty">Loading…</div>
       </section>
     </div>
 
     <div class="col">
       <section class="card" id="newsCard">
-        <h2>📰 News</h2>
+        <h2><span class="accent">📰</span> Top Headlines</h2>
         <div id="newsBody" class="empty">Loading…</div>
       </section>
     </div>
   </div>
 
-    <section class="card" style="margin-top:1rem">
-      <h2>🔑 API Secrets</h2>
-      <p class="hint">Settings are stored in Redis and used automatically — no restart needed. Built-in names:
-        <code>NEWS_API_KEY</code> (news key), <code>WEATHER_LOCATION</code> (e.g. <code>55.75,37.62</code>), <code>MAIN_CURRENCY</code> (e.g. <code>EUR</code>).
-        Values are never shown back — only names.</p>
-      <form class="form-row" id="secretForm">
-        <input id="secretName" placeholder="Name (e.g. NEWS_API_KEY)" required>
-        <input id="secretValue" type="text" placeholder="Value" autocomplete="off" required>
-        <button type="submit">Save</button>
-      </form>
-      <ul class="secrets" id="secretList"></ul>
-    </section>
+  <section class="card section-gap">
+    <h2><span class="accent">🔑</span> API Secrets</h2>
+    <p class="hint">Stored in Redis and applied automatically — no restart needed. Built-in names:
+      <code>NEWS_API_KEY</code> (news key), <code>WEATHER_LOCATION</code> (e.g. <code>55.75,37.62</code>), <code>MAIN_CURRENCY</code> (e.g. <code>EUR</code>).
+      Values are never shown back — only names.</p>
+    <form class="form-row" id="secretForm">
+      <input id="secretName" placeholder="Name (e.g. NEWS_API_KEY)" required>
+      <input id="secretValue" type="text" placeholder="Value" autocomplete="off" required>
+      <button type="submit">Save</button>
+    </form>
+    <ul class="secrets" id="secretList"></ul>
+  </section>
 </div>
 
 <script>
@@ -115,6 +206,7 @@ const btn = document.getElementById('refresh');
 const badge = document.getElementById('badge');
 const metaEl = document.getElementById('meta');
 const errBanner = document.getElementById('errBanner');
+const errText = document.getElementById('errText');
 const weatherBody = document.getElementById('weatherBody');
 const weatherTitle = document.getElementById('weatherTitle');
 const newsBody = document.getElementById('newsBody');
@@ -124,62 +216,117 @@ const secretName = document.getElementById('secretName');
 const secretValue = document.getElementById('secretValue');
 const secretList = document.getElementById('secretList');
 
-const WEATHER_CODES = { 0:'Clear sky',1:'Mainly clear',2:'Partly cloudy',3:'Overcast',45:'Fog',48:'Rime fog',51:'Light drizzle',53:'Drizzle',55:'Dense drizzle',61:'Light rain',63:'Rain',65:'Heavy rain',71:'Light snow',73:'Snow',75:'Heavy snow',80:'Light showers',81:'Showers',82:'Violent showers',95:'Thunderstorm',96:'Thunderstorm, hail',99:'Thunderstorm, heavy hail' };
+const WEATHER = {
+  0:{d:'☀️','n':'🌙',t:'Clear sky'},1:{d:'🌤️','n':'🌙',t:'Mainly clear'},2:{d:'⛅','n':'⛅',t:'Partly cloudy'},
+  3:{d:'☁️','n':'☁️',t:'Overcast'},45:{d:'🌫️','n':'🌫️',t:'Fog'},48:{d:'🌫️','n':'🌫️',t:'Rime fog'},
+  51:{d:'🌦️','n':'🌦️',t:'Light drizzle'},53:{d:'🌦️','n':'🌦️',t:'Drizzle'},55:{d:'🌧️','n':'🌧️',t:'Dense drizzle'},
+  61:{d:'🌧️','n':'🌧️',t:'Light rain'},63:{d:'🌧️','n':'🌧️',t:'Rain'},65:{d:'🌧️','n':'🌧️',t:'Heavy rain'},
+  71:{d:'🌨️','n':'🌨️',t:'Light snow'},73:{d:'🌨️','n':'🌨️',t:'Snow'},75:{d:'🌨️','n':'🌨️',t:'Heavy snow'},
+  80:{d:'🌦️','n':'🌦️',t:'Light showers'},81:{d:'🌧️','n':'🌧️',t:'Showers'},82:{d:'⛈️','n':'⛈️',t:'Violent showers'},
+  95:{d:'⛈️','n':'⛈️',t:'Thunderstorm'},96:{d:'⛈️','n':'⛈️',t:'Thunderstorm, hail'},99:{d:'⛈️','n':'⛈️',t:'Heavy hail'}
+};
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
-
 function stat(k, v) { return `<div class="stat"><span class="k">${esc(k)}</span><span class="v">${esc(v)}</span></div>`; }
+function fmt(v, suffix) { return (v != null && v !== '') ? v + (suffix || '') : '—'; }
+
+function windDir(deg) {
+  if (deg == null) return '';
+  const dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
+  return ' ' + dirs[Math.round(deg / 22.5) % 16];
+}
+function timeAgo(iso) {
+  if (!iso) return '';
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000 | 0);
+  if (s < 45) return 'just now';
+  if (s < 3600) return Math.round(s / 60) + 'm ago';
+  if (s < 86400) return Math.round(s / 3600) + 'h ago';
+  return Math.round(s / 86400) + 'd ago';
+}
+function fmtDate(iso, withTime) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const date = d.toLocaleDateString('en-US', { day: '2-digit', month: 'short', year: withTime ? undefined : 'numeric' });
+  if (!withTime) return date;
+  const time = d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+  return date + ' · ' + time;
+}
+function coord(v, pos, neg) {
+  if (v == null) return '—';
+  return Math.abs(v).toFixed(2) + '° ' + (v >= 0 ? pos : neg);
+}
 
 function renderWeather(d) {
   if (!d) return '<div class="empty">No data</div>';
   const cw = d.current_weather || {};
-  const code = WEATHER_CODES[cw.weathercode] ?? ('Code ' + cw.weathercode);
-  return stat('Location', (d.latitude != null ? d.latitude + ', ' + d.longitude : '—'))
-       + stat('Condition', code)
-       + stat('Temperature', (cw.temperature != null ? cw.temperature + ' °C' : '—'))
-       + stat('Wind', (cw.windspeed != null ? cw.windspeed + ' km/h' : '—'))
-       + stat('Elevation', (d.elevation != null ? d.elevation + ' m' : '—'))
-       + stat('Timezone', d.timezone || '—');
+  const w = WEATHER[cw.weathercode];
+  const icon = (w && w[cw.is_day ? 'd' : 'n']) || '🌡️';
+  const cond = (w && w.t) || 'Code ' + (cw.weathercode ?? '—');
+  return `<div class="fade">
+    <div class="weather-hero">
+      <span class="icon">${icon}</span>
+      <div>
+        <div class="temp">${fmt(cw.temperature, '°')}</div>
+        <div class="cond">${esc(cond)}</div>
+      </div>
+    </div>
+    <div class="stat-grid">
+      ${stat('Location', d.latitude != null ? coord(d.latitude, 'N', 'S') + ', ' + coord(d.longitude, 'E', 'W') : '—')}
+      ${stat('Wind', fmt(cw.windspeed, ' km/h') + windDir(cw.winddirection))}
+      ${stat('Elevation', fmt(d.elevation, ' m'))}
+      ${stat('Updated', fmtDate(cw.time, true))}
+    </div>
+  </div>`;
+}
+
+function renderRates(d) {
+  if (!d || !d.rates || typeof d.rates !== 'object') return '<div class="empty">No data</div>';
+  const base = (d.base || 'USD').toUpperCase();
+  const fmt = v => (typeof v === 'number' ? v.toFixed(4) : v);
+  const popular = ['USD','EUR','GBP','JPY','CHF','CNY','CAD','AUD','INR','RUB','BRL','KRW','TRY','MXN','SGD','NZD'];
+  const rows = [];
+  const seen = new Set([base]);
+  for (const code of [...popular, ...Object.keys(d.rates)]) {
+    if (rows.length >= 10 || seen.has(code) || d.rates[code] == null) continue;
+    rows.push(`<div class="rate"><span class="code">${esc(code)}</span><span class="val">${fmt(d.rates[code])}</span></div>`);
+    seen.add(code);
+  }
+  return `<div class="fade">
+    <div class="rates-head"><span class="base-group">Base: <span class="base">${esc(base)}</span></span><span class="date">${esc(fmtDate(d.date, false))}</span></div>
+    <div class="rates-grid">${rows.join('')}</div>
+  </div>`;
 }
 
 function renderNews(d, keyMissing) {
   if (keyMissing) return '<div class="empty">Missing API key — add <code>NEWS_API_KEY</code> in the 🔑 API Secrets section below.</div>';
   if (!d) return '<div class="empty">No data</div>';
   if (Array.isArray(d.articles) && d.articles.length) {
-    const items = d.articles.slice(0, 10).map(a => `
-      <li><a href="${esc(a.url || '#')}" target="_blank" rel="noopener">${esc(a.title || 'Untitled')}</a>
-      <span class="src">${esc((a.source && a.source.name) || 'unknown source')}</span></li>`).join('');
-    return `<ul class="articles">${items}</ul>`;
+    const items = d.articles.slice(0, 10).map(a => {
+      const ago = timeAgo(a.publishedAt);
+      return `<li><a href="${esc(a.url || '#')}" target="_blank" rel="noopener">${esc(a.title || 'Untitled')}</a>
+        <span class="src"><span class="dot"></span>${esc((a.source && a.source.name) || 'unknown source')}${ago ? ' · ' + ago : ''}</span></li>`;
+    }).join('');
+    return `<ul class="articles fade">${items}</ul>`;
   }
   if (d.status === 'error') return '<div class="empty">Error: ' + esc(d.message || d.code || 'unknown') + '</div>';
   return '<div class="empty">No articles</div>';
 }
 
-const POPULAR_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CNY', 'CAD', 'AUD', 'INR', 'RUB', 'BRL', 'KRW', 'TRY', 'MXN'];
-
-function renderRates(d) {
-  if (!d || typeof d !== 'object') return '<div class="empty">No data</div>';
-  const rates = d.rates;
-  if (!rates || typeof rates !== 'object') return '<div class="empty">No data</div>';
-  const base = (d.base || 'USD').toUpperCase();
-  const fmt = v => (typeof v === 'number' ? v.toFixed(4) : v);
-  const rows = [stat('Base', base)];
-  const shown = new Set([base]);
-  for (const code of [...POPULAR_CURRENCIES, ...Object.keys(rates)]) {
-    if (rows.length >= 10 || shown.has(code) || rates[code] == null) continue;
-    rows.push(stat('1 ' + base + ' =', fmt(rates[code]) + ' ' + code));
-    shown.add(code);
-  }
-  rows.push(stat('Date', d.date || '—'));
-  return rows.join('');
+function skeletonLines(n) {
+  return Array.from({length: n}, (_, i) => `<div class="skeleton" style="height:14px;margin-bottom:${i < n-1 ? '10px' : 0}"></div>`).join('');
 }
 
 async function load() {
   btn.classList.add('loading'); btn.disabled = true;
   badge.textContent = 'loading…'; badge.className = 'badge loading';
   errBanner.hidden = true;
+
+  if (!weatherBody.innerHTML.includes('skeleton')) weatherBody.innerHTML = skeletonLines(5);
+  if (!newsBody.innerHTML.includes('skeleton')) newsBody.innerHTML = skeletonLines(6);
+  if (!ratesBody.innerHTML.includes('skeleton')) ratesBody.innerHTML = skeletonLines(6);
 
   try {
     const res = await fetch('/dashboard');
@@ -194,32 +341,46 @@ async function load() {
 
     if (missing.length) {
       badge.textContent = 'needs key'; badge.className = 'badge err';
-      errBanner.textContent = 'Missing API key(s): ' + missing.join(', ') + ' — add them in the 🔑 API Secrets section below.';
+      errText.textContent = 'Missing API key(s): ' + missing.join(', ') + ' — add them in the 🔑 API Secrets section below.';
       errBanner.hidden = false;
     } else if (data.error || !allOk) {
       badge.textContent = 'partial'; badge.className = 'badge err';
-      if (data.error) { errBanner.textContent = data.error; errBanner.hidden = false; }
+      if (data.error) { errText.textContent = data.error; errBanner.hidden = false; }
     } else {
       badge.textContent = 'ok'; badge.className = 'badge ok';
     }
 
     weatherBody.innerHTML = renderWeather(data.weather);
-    weatherTitle.textContent = '🌤️ Weather' + (data.weatherPlace ? ' — ' + data.weatherPlace : '');
+    weatherTitle.textContent = 'Weather' + (data.weatherPlace ? ' — ' + data.weatherPlace : '');
     newsBody.innerHTML = renderNews(data.news, missing.includes('NEWS_API_KEY'));
     ratesBody.innerHTML = renderRates(data.rates);
 
-    metaEl.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' — weather:' + (hasWeather ? 'ok' : '✗') + ' · news:' + (hasNews ? 'ok' : '✗') + ' · rates:' + (hasRates ? 'ok' : '✗');
+    metaEl.textContent = 'Updated ' + new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) +
+      ' — weather:' + (hasWeather ? 'ok' : '✗') + ' · news:' + (hasNews ? 'ok' : '✗') + ' · rates:' + (hasRates ? 'ok' : '✗');
   } catch (err) {
     badge.textContent = 'error'; badge.className = 'badge err';
-    errBanner.textContent = 'Failed to load: ' + err.message; errBanner.hidden = false;
-    metaEl.textContent = 'Last attempt failed at ' + new Date().toLocaleTimeString();
+    errText.textContent = 'Failed to load: ' + err.message; errBanner.hidden = false;
+    metaEl.textContent = 'Last attempt failed at ' + new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
   } finally {
     btn.classList.remove('loading'); btn.disabled = false;
   }
 }
 
 btn.addEventListener('click', load);
+
+const autoRef = document.getElementById('autoRef');
+let autoTimer = null;
+function scheduleAuto() {
+  clearInterval(autoTimer);
+  if (autoRef.checked) autoTimer = setInterval(() => { if (!document.hidden) load(); }, 60000);
+}
+autoRef.addEventListener('change', () => {
+  if (autoRef.checked) load();
+  scheduleAuto();
+});
+
 load();
+scheduleAuto();
 
 async function loadSecrets() {
   try {

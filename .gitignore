@@ -36,5 +36,6 @@ appendonlydir/
 # .vscode/
 
 
-# Agents
+# opencode
 Agents.md
+.opencode/skills/
