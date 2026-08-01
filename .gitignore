@@ -27,6 +27,14 @@ go.work.sum
 # env file
 .env
 
+# local Redis persistence artifacts
+dump.rdb
+appendonlydir/
+
 # Editor/IDE
 # .idea/
 # .vscode/
+
+
+# Agents
+Agents.md
