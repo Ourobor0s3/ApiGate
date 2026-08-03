@@ -57,3 +57,40 @@ func TestShouldCache(t *testing.T) {
 		}
 	}
 }
+
+func TestTTLFor(t *testing.T) {
+	c := New(nil, Config{
+		DefaultTTL: 300,
+		RouteTTLs:  map[string]int64{"/weather": 300, "/news": 60},
+	})
+
+	if got, want := c.ttlFor("/news"), int64(60); got != want {
+		t.Errorf("ttlFor(/news) = %d, want %d", got, want)
+	}
+	if got, want := c.ttlFor("/weather"), int64(300); got != want {
+		t.Errorf("ttlFor(/weather) = %d, want %d", got, want)
+	}
+	// Exact-match, not prefix: a path with a route-name prefix must not inherit
+	// the route TTL.
+	if got, want := c.ttlFor("/weather/v2"), int64(300); got != want {
+		t.Errorf("ttlFor(/weather/v2) = %d, want default %d", got, want)
+	}
+	if got, want := c.ttlFor("/unknown"), int64(300); got != want {
+		t.Errorf("ttlFor(/unknown) = %d, want default %d", got, want)
+	}
+}
+
+func TestStorableHeadersStripsDate(t *testing.T) {
+	in := http.Header{
+		"Date":         []string{"Sun, 01 Jan 2026 00:00:00 GMT"},
+		"Content-Type": []string{"application/json"},
+	}
+	out := storableHeaders(in)
+
+	if _, ok := out["Date"]; ok {
+		t.Errorf("storableHeaders() kept Date: %v", out)
+	}
+	if out.Get("Content-Type") != "application/json" {
+		t.Errorf("storableHeaders() lost Content-Type: %v", out)
+	}
+}

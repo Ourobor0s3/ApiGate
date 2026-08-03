@@ -142,6 +142,122 @@ func TestServeHTTP(t *testing.T) {
 	}
 }
 
+func TestServeHTTPNewsQuotaExhausted(t *testing.T) {
+	weather := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{"weather": "ok"})
+	}))
+	defer weather.Close()
+
+	place := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{"city": "Rome"})
+	}))
+	defer place.Close()
+
+	newsHit := false
+	news := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		newsHit = true
+	}))
+	defer news.Close()
+
+	rates := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"base":  "USD",
+			"rates": map[string]interface{}{"EUR": 0.9},
+		})
+	}))
+	defer rates.Close()
+
+	h := New(
+		func(context.Context, string) string { return "" },
+		WithHTTPClient(weather.Client()),
+		WithWeatherURL(weather.URL),
+		WithPlaceURL(place.URL),
+		WithNewsURL(news.URL),
+		WithRatesURL(rates.URL),
+		WithNewsQuota(denyQuota{}),
+	)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
+
+	var data DashboardData
+	if err := json.NewDecoder(rec.Body).Decode(&data); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if newsHit {
+		t.Error("news upstream hit despite exhausted quota")
+	}
+	m, ok := data.News.(map[string]interface{})
+	if !ok || m["status"] != "error" || m["code"] != "dailyQuotaExhausted" {
+		t.Errorf("News = %v, want dailyQuotaExhausted error object", data.News)
+	}
+	if data.Error != "" {
+		t.Errorf("Error = %q, want empty", data.Error)
+	}
+	if data.Weather == nil {
+		t.Error("Weather not populated")
+	}
+}
+
+func TestServeHTTPNewsQuotaAllowed(t *testing.T) {
+	weather := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{"weather": "ok"})
+	}))
+	defer weather.Close()
+
+	place := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{"city": "Rome"})
+	}))
+	defer place.Close()
+
+	newsHit := false
+	news := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		newsHit = true
+		json.NewEncoder(w).Encode(map[string]interface{}{"articles": []interface{}{}})
+	}))
+	defer news.Close()
+
+	rates := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"base":  "USD",
+			"rates": map[string]interface{}{"EUR": 0.9},
+		})
+	}))
+	defer rates.Close()
+
+	h := New(
+		func(context.Context, string) string { return "" },
+		WithHTTPClient(weather.Client()),
+		WithWeatherURL(weather.URL),
+		WithPlaceURL(place.URL),
+		WithNewsURL(news.URL),
+		WithRatesURL(rates.URL),
+		WithNewsQuota(allowQuota{}),
+	)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
+
+	var data DashboardData
+	if err := json.NewDecoder(rec.Body).Decode(&data); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !newsHit {
+		t.Error("news upstream not hit despite available quota")
+	}
+	if data.News == nil {
+		t.Error("News not populated")
+	}
+}
+
+type denyQuota struct{}
+
+func (denyQuota) Allow(context.Context) (bool, error) { return false, nil }
+
+type allowQuota struct{}
+
+func (allowQuota) Allow(context.Context) (bool, error) { return true, nil }
+
 func TestServeHTTPAllFailures(t *testing.T) {
 	fail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusServiceUnavailable)

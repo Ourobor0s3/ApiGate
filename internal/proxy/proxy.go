@@ -82,16 +82,24 @@ func newReverseProxy(prefix, target string, params map[string]func(context.Conte
 			req.URL.RawPath = ""
 			req.Host = targetURL.Host
 
+			// Merge query params baked into the target URL (e.g. ?country=us),
+			// letting the request's own params take precedence; then fill in any
+			// param resolvers (the news apiKey). Encode once at the end.
+			rq := req.URL.Query()
+			for k, vs := range targetURL.Query() {
+				if _, ok := rq[k]; !ok {
+					rq[k] = vs
+				}
+			}
 			for name, fn := range params {
-				if req.URL.Query().Get(name) != "" {
+				if rq.Get(name) != "" {
 					continue
 				}
 				if v := fn(req.Context()); v != "" {
-					q := req.URL.Query()
-					q.Set(name, v)
-					req.URL.RawQuery = q.Encode()
+					rq.Set(name, v)
 				}
 			}
+			req.URL.RawQuery = rq.Encode()
 		},
 		Transport: transport,
 	}, nil

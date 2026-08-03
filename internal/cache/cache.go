@@ -65,14 +65,24 @@ func (c *Cache) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
+		headers := storableHeaders(w.Header())
+
 		resp := &cachedResponse{
 			Status:  cr.code,
-			Headers: w.Header().Clone(),
+			Headers: headers,
 			Body:    cr.buf.Bytes(),
 		}
 		ttl := c.ttlFor(r.URL.Path)
 		c.rdb.Set(ctx, key, encodeResponse(resp), time.Duration(ttl)*time.Second)
 	})
+}
+
+// storableHeaders clones response headers, dropping the original Date so the
+// cached copy never serves a stale timestamp.
+func storableHeaders(h http.Header) http.Header {
+	clone := h.Clone()
+	clone.Del("Date")
+	return clone
 }
 
 func (c *Cache) shouldCache(path string) bool {
@@ -85,10 +95,8 @@ func (c *Cache) shouldCache(path string) bool {
 }
 
 func (c *Cache) ttlFor(path string) int64 {
-	for prefix, ttl := range c.cfg.RouteTTLs {
-		if strings.HasPrefix(path, prefix) {
-			return ttl
-		}
+	if ttl, ok := c.cfg.RouteTTLs[path]; ok {
+		return ttl
 	}
 	return c.cfg.DefaultTTL
 }

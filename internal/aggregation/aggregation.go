@@ -11,14 +11,26 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Ourobor0s3/ApiGate/internal/quota"
 )
 
 const (
-	defaultWeatherURL = "https://api.open-meteo.com/v1/forecast"
-	defaultNewsURL    = "https://newsapi.org/v2/top-headlines?country=us"
-	defaultPlaceURL   = "https://api.bigdatacloud.net/data/reverse-geocode-client"
-	defaultRatesURL   = "https://api.exchangerate-api.com/v4/latest"
-	defaultTimeout    = 10 * time.Second
+	// DefaultWeatherURL and DefaultNewsURL are the upstream bases used when
+	// no WEATHER_API_URL / NEWS_API_URL override is set.
+	DefaultWeatherURL = "https://api.open-meteo.com/v1/forecast"
+	// DefaultNewsURL uses /v2/everything (popular English articles from all
+	// countries, not a single country's top headlines), capped at 20 so the
+	// dashboard doesn't pull the default 100-article payload.
+	DefaultNewsURL = "https://newsapi.org/v2/everything?language=en&sortBy=popularity&pageSize=20"
+
+	defaultPlaceURL = "https://api.bigdatacloud.net/data/reverse-geocode-client"
+	defaultRatesURL = "https://api.exchangerate-api.com/v4/latest"
+	defaultTimeout  = 10 * time.Second
+	// maxBodyBytes caps a single upstream response so a misbehaving or
+	// compromised source can't balloon dashboard memory. All four upstreams
+	// return well under 1 MiB.
+	maxBodyBytes = 1 << 20
 )
 
 type DashboardData struct {
@@ -37,10 +49,18 @@ type Handler struct {
 	httpClient *http.Client
 	logger     *slog.Logger
 	getSecret  func(context.Context, string) string
+	newsQuota  NewsQuota
 	weatherURL string
 	newsURL    string
 	placeURL   string
 	ratesURL   string
+}
+
+// NewsQuota gates upstream newsapi consumption so the daily free-plan budget
+// is shared between the /news route and the dashboard news block. A nil quota
+// disables the check.
+type NewsQuota interface {
+	Allow(ctx context.Context) (bool, error)
 }
 
 type Option func(*Handler)
@@ -49,16 +69,16 @@ func WithHTTPClient(c *http.Client) Option {
 	return func(h *Handler) { h.httpClient = c }
 }
 
-func WithLogger(l *slog.Logger) Option {
-	return func(h *Handler) { h.logger = l }
-}
-
 func WithWeatherURL(u string) Option {
 	return func(h *Handler) { h.weatherURL = u }
 }
 
 func WithNewsURL(u string) Option {
 	return func(h *Handler) { h.newsURL = u }
+}
+
+func WithNewsQuota(q NewsQuota) Option {
+	return func(h *Handler) { h.newsQuota = q }
 }
 
 func WithPlaceURL(u string) Option {
@@ -74,8 +94,8 @@ func New(getSecret func(context.Context, string) string, opts ...Option) *Handle
 		httpClient: &http.Client{Timeout: 8 * time.Second},
 		logger:     slog.Default(),
 		getSecret:  getSecret,
-		weatherURL: defaultWeatherURL,
-		newsURL:    defaultNewsURL,
+		weatherURL: DefaultWeatherURL,
+		newsURL:    DefaultNewsURL,
 		placeURL:   defaultPlaceURL,
 		ratesURL:   defaultRatesURL,
 	}
@@ -89,63 +109,68 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), defaultTimeout)
 	defer cancel()
 
-	var mu sync.Mutex
-	result := &DashboardData{}
-	var wg sync.WaitGroup
-
+	col := &collector{res: &DashboardData{}}
 	lat, lon := parseLocation(h.getSecret(ctx, "WEATHER_LOCATION"))
 
-	wg.Add(4)
-	go h.fetchJSON(ctx, &mu, &wg, result, "weather", h.weatherURLFor(lat, lon))
-	go h.fetchJSON(ctx, &mu, &wg, result, "place", h.placeURLFor(lat, lon))
-	go h.fetchJSON(ctx, &mu, &wg, result, "news", h.newsURLFor(ctx))
-	go h.fetchJSON(ctx, &mu, &wg, result, "rates", h.ratesURLFor(ctx))
-	wg.Wait()
-
-	if isKeyError(result.News) {
-		result.MissingSecrets = append(result.MissingSecrets, "NEWS_API_KEY")
+	fetchNews := true
+	if h.newsQuota != nil {
+		allowed, err := h.newsQuota.Allow(ctx)
+		switch {
+		case err != nil:
+			// Fail open on a broken quota backend: the budget check is a
+			// courtesy, not a hard dependency of the dashboard.
+			h.logger.Warn("dashboard: news quota check failed", "err", err)
+		case !allowed:
+			fetchNews = false
+			col.set("news", newsQuotaError())
+		}
 	}
 
-	if result.Weather == nil && result.News == nil && result.Rates == nil {
-		result.Error = "all upstream services failed"
+	col.wg.Add(3)
+	go h.fetchJSON(ctx, col, "weather", h.weatherURLFor(lat, lon))
+	go h.fetchJSON(ctx, col, "place", h.placeURLFor(lat, lon))
+	go h.fetchJSON(ctx, col, "rates", h.ratesURLFor(ctx))
+	if fetchNews {
+		col.wg.Add(1)
+		go h.fetchJSON(ctx, col, "news", h.newsURLFor(ctx))
+	}
+	col.wg.Wait()
+
+	res := col.res
+	if isKeyError(res.News) {
+		res.MissingSecrets = append(res.MissingSecrets, "NEWS_API_KEY")
+	}
+	if res.Weather == nil && res.News == nil && res.Rates == nil {
+		res.Error = "all upstream services failed"
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
-	json.NewEncoder(w).Encode(result)
+	json.NewEncoder(w).Encode(res)
 }
 
 func (h *Handler) weatherURLFor(lat, lon float64) string {
-	u, err := addQuery(h.weatherURL, url.Values{
+	return h.addQueryOr(h.weatherURL, url.Values{
 		"latitude":        []string{strconv.FormatFloat(lat, 'f', 4, 64)},
 		"longitude":       []string{strconv.FormatFloat(lon, 'f', 4, 64)},
 		"current_weather": []string{"true"},
 	})
-	if err != nil {
-		return h.weatherURL
-	}
-	return u
 }
 
 func (h *Handler) placeURLFor(lat, lon float64) string {
-	u, err := addQuery(h.placeURL, url.Values{
+	return h.addQueryOr(h.placeURL, url.Values{
 		"latitude":         []string{strconv.FormatFloat(lat, 'f', 6, 64)},
 		"longitude":        []string{strconv.FormatFloat(lon, 'f', 6, 64)},
 		"localityLanguage": []string{"en"},
 	})
-	if err != nil {
-		return h.placeURL
-	}
-	return u
 }
 
 func (h *Handler) newsURLFor(ctx context.Context) string {
-	if k := h.getSecret(ctx, "NEWS_API_KEY"); k != "" {
-		if u, err := addQuery(h.newsURL, url.Values{"apiKey": []string{k}}); err == nil {
-			return u
-		}
+	k := h.getSecret(ctx, "NEWS_API_KEY")
+	if k == "" {
+		return h.newsURL
 	}
-	return h.newsURL
+	return h.addQueryOr(h.newsURL, url.Values{"apiKey": []string{k}})
 }
 
 func (h *Handler) ratesURLFor(ctx context.Context) string {
@@ -154,6 +179,16 @@ func (h *Handler) ratesURLFor(ctx context.Context) string {
 		base = "USD"
 	}
 	return h.ratesURL + "/" + url.PathEscape(base)
+}
+
+// addQueryOr returns base with params merged in, or base unchanged when the
+// URL is unparseable.
+func (h *Handler) addQueryOr(base string, params url.Values) string {
+	u, err := addQuery(base, params)
+	if err != nil {
+		return base
+	}
+	return u
 }
 
 // addQuery merges params into base's existing query string, preserving any
@@ -188,6 +223,16 @@ func parseLocation(location string) (float64, float64) {
 	return lat, lon
 }
 
+// newsQuotaError is a synthetic newsapi-style error object rendered as an
+// error card on the dashboard when the daily news budget is exhausted.
+func newsQuotaError() map[string]interface{} {
+	return map[string]interface{}{
+		"status":  "error",
+		"code":    quota.ExhaustedCode,
+		"message": quota.ExhaustedMessage,
+	}
+}
+
 // isKeyError reports whether an upstream error object indicates a missing or
 // invalid API key (e.g. newsapi's {"status":"error","code":"apiKeyMissing"}).
 func isKeyError(v interface{}) bool {
@@ -203,8 +248,8 @@ func isKeyError(v interface{}) bool {
 	return false
 }
 
-func (h *Handler) fetchJSON(ctx context.Context, mu *sync.Mutex, wg *sync.WaitGroup, dst *DashboardData, field, url string) {
-	defer wg.Done()
+func (h *Handler) fetchJSON(ctx context.Context, col *collector, field, url string) {
+	defer col.wg.Done()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -219,7 +264,7 @@ func (h *Handler) fetchJSON(ctx context.Context, mu *sync.Mutex, wg *sync.WaitGr
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
 		h.logger.Warn("dashboard: read body", "field", field, "err", err)
 		return
@@ -240,25 +285,38 @@ func (h *Handler) fetchJSON(ctx context.Context, mu *sync.Mutex, wg *sync.WaitGr
 		return
 	}
 
-	mu.Lock()
+	col.set(field, data)
+}
+
+// collector merges concurrent upstream fetches into a single DashboardData.
+type collector struct {
+	mu  sync.Mutex
+	wg  sync.WaitGroup
+	res *DashboardData
+}
+
+// set writes field's value under the mutex. The "rates" and "place" fields
+// consume the raw JSON object instead of storing it wholesale.
+func (c *collector) set(field string, v interface{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	switch field {
 	case "weather":
-		dst.Weather = data
+		c.res.Weather = v
 	case "news":
-		dst.News = data
+		c.res.News = v
 	case "rates":
-		if m, ok := data.(map[string]interface{}); ok {
-			dst.Rates = m
+		if m, ok := v.(map[string]interface{}); ok {
+			c.res.Rates = m
 		}
 	case "place":
-		if m, ok := data.(map[string]interface{}); ok {
+		if m, ok := v.(map[string]interface{}); ok {
 			for _, k := range []string{"city", "locality", "principalSubdivision"} {
 				if s, _ := m[k].(string); s != "" {
-					dst.WeatherPlace = s
+					c.res.WeatherPlace = s
 					break
 				}
 			}
 		}
 	}
-	mu.Unlock()
 }

@@ -10,12 +10,15 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/Ourobor0s3/ApiGate/internal/aggregation"
 	"github.com/Ourobor0s3/ApiGate/internal/cache"
+	"github.com/Ourobor0s3/ApiGate/internal/middleware"
 	"github.com/Ourobor0s3/ApiGate/internal/proxy"
+	"github.com/Ourobor0s3/ApiGate/internal/quota"
 	"github.com/Ourobor0s3/ApiGate/internal/ratelimit"
 	"github.com/Ourobor0s3/ApiGate/internal/secrets"
 	"github.com/redis/go-redis/v9"
@@ -64,9 +67,12 @@ func run(ctx context.Context) error {
 		return os.Getenv(name)
 	}
 
+	weatherAPI := envOrDefault("WEATHER_API_URL", aggregation.DefaultWeatherURL)
+	newsAPI := envOrDefault("NEWS_API_URL", aggregation.DefaultNewsURL)
+
 	p, err := proxy.New(proxy.Config{
-		WeatherAPI: envOrDefault("WEATHER_API_URL", "https://api.open-meteo.com/v1/forecast"),
-		NewsAPI:    envOrDefault("NEWS_API_URL", "https://newsapi.org/v2/top-headlines"),
+		WeatherAPI: weatherAPI,
+		NewsAPI:    newsAPI,
 		NewsAPIKey: func(ctx context.Context) string { return getSecret(ctx, "NEWS_API_KEY") },
 	})
 	if err != nil {
@@ -76,22 +82,27 @@ func run(ctx context.Context) error {
 	c := cache.New(rdb, cache.Config{
 		DefaultTTL:   300,
 		RouteTTLs:    map[string]int64{"/weather": 300, "/news": 60},
-		NoCachePaths: []string{"/dashboard", "/api/secrets", "/"},
+		NoCachePaths: []string{"/dashboard", "/api/secrets", "/", "/healthz"},
 	})
 
 	rl := ratelimit.New(rdb, ratelimit.Config{
-		Limit:  100,
-		Window: 60,
+		Limit:            100,
+		Window:           60,
+		NoRateLimitPaths: []string{"/healthz"},
 	})
 
-	aggOpts := []aggregation.Option{}
-	if u := os.Getenv("WEATHER_API_URL"); u != "" {
-		aggOpts = append(aggOpts, aggregation.WithWeatherURL(u))
-	}
-	if u := os.Getenv("NEWS_API_URL"); u != "" {
-		aggOpts = append(aggOpts, aggregation.WithNewsURL(u))
-	}
-	agg := aggregation.New(getSecret, aggOpts...)
+	// newsQuota caps newsapi consumption at 100 requests/day (free plan),
+	// shared by the /news route and the dashboard news block.
+	newsQuota := quota.New(rdb, quota.Config{
+		Name:  "news",
+		Limit: envInt64OrDefault("NEWS_DAILY_LIMIT", 100),
+	})
+
+	agg := aggregation.New(getSecret,
+		aggregation.WithWeatherURL(weatherAPI),
+		aggregation.WithNewsURL(newsAPI),
+		aggregation.WithNewsQuota(newsQuota),
+	)
 
 	staticSub, err := fs.Sub(staticFS, "static")
 	if err != nil {
@@ -100,18 +111,22 @@ func run(ctx context.Context) error {
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /weather", p.Weather())
-	mux.Handle("GET /news", p.News())
+	mux.Handle("GET /news", newsQuota.Middleware(p.News()))
 	mux.Handle("GET /dashboard", agg)
+	mux.Handle("GET /healthz", middleware.Health(rdb, logger))
 	secrets.NewHandler(store).Register(mux)
 	mux.Handle("GET /", noCache(http.FileServer(http.FS(staticSub))))
 
 	var h http.Handler = mux
 	h = c.Middleware(h)
 	h = rl.Middleware(h)
+	h = middleware.Recover(logger, h)
+	h = middleware.RequestLogger(logger, h)
 
 	httpServer := &http.Server{
 		Addr:              ":" + envOrDefault("PORT", "8080"),
 		Handler:           h,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -152,6 +167,15 @@ func noCache(next http.Handler) http.Handler {
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func envInt64OrDefault(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
 	}
 	return def
 }
