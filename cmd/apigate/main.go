@@ -16,7 +16,9 @@ import (
 
 	"github.com/Ourobor0s3/ApiGate/internal/aggregation"
 	"github.com/Ourobor0s3/ApiGate/internal/cache"
+	"github.com/Ourobor0s3/ApiGate/internal/checks"
 	"github.com/Ourobor0s3/ApiGate/internal/middleware"
+	"github.com/Ourobor0s3/ApiGate/internal/newsstore"
 	"github.com/Ourobor0s3/ApiGate/internal/proxy"
 	"github.com/Ourobor0s3/ApiGate/internal/quota"
 	"github.com/Ourobor0s3/ApiGate/internal/ratelimit"
@@ -82,7 +84,7 @@ func run(ctx context.Context) error {
 	c := cache.New(rdb, cache.Config{
 		DefaultTTL:   300,
 		RouteTTLs:    map[string]int64{"/weather": 300, "/news": 60},
-		NoCachePaths: []string{"/dashboard", "/api/secrets", "/", "/healthz"},
+		NoCachePaths: []string{"/dashboard", "/api/secrets", "/api/checks", "/style.css", "/app.js", "/", "/healthz"},
 	})
 
 	rl := ratelimit.New(rdb, ratelimit.Config{
@@ -102,7 +104,14 @@ func run(ctx context.Context) error {
 		aggregation.WithWeatherURL(weatherAPI),
 		aggregation.WithNewsURL(newsAPI),
 		aggregation.WithNewsQuota(newsQuota),
+		aggregation.WithNewsStore(newsstore.New(rdb)),
 	)
+
+	chk := checks.New(rdb, checks.Config{
+		Interval: func(ctx context.Context) time.Duration {
+			return checks.ParseInterval(getSecret(ctx, "CHECK_INTERVAL"))
+		},
+	})
 
 	staticSub, err := fs.Sub(staticFS, "static")
 	if err != nil {
@@ -115,6 +124,7 @@ func run(ctx context.Context) error {
 	mux.Handle("GET /dashboard", agg)
 	mux.Handle("GET /healthz", middleware.Health(rdb, logger))
 	secrets.NewHandler(store).Register(mux)
+	checks.NewHandler(chk).Register(mux)
 	mux.Handle("GET /", noCache(http.FileServer(http.FS(staticSub))))
 
 	var h http.Handler = mux
@@ -132,6 +142,8 @@ func run(ctx context.Context) error {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+
+	go chk.Run(ctx)
 
 	errCh := make(chan error, 1)
 	go func() {

@@ -3,11 +3,15 @@ package aggregation
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/Ourobor0s3/ApiGate/internal/newsstore"
 )
 
 func TestParseLocation(t *testing.T) {
@@ -143,50 +147,14 @@ func TestServeHTTP(t *testing.T) {
 }
 
 func TestServeHTTPNewsQuotaExhausted(t *testing.T) {
-	weather := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]interface{}{"weather": "ok"})
-	}))
-	defer weather.Close()
-
-	place := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]interface{}{"city": "Rome"})
-	}))
-	defer place.Close()
-
-	newsHit := false
 	news := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		newsHit = true
+		t.Error("news upstream hit despite exhausted quota")
 	}))
 	defer news.Close()
 
-	rates := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"base":  "USD",
-			"rates": map[string]interface{}{"EUR": 0.9},
-		})
-	}))
-	defer rates.Close()
+	h := testDashboard(t, WithNewsURL(news.URL), WithNewsQuota(denyQuota{}))
 
-	h := New(
-		func(context.Context, string) string { return "" },
-		WithHTTPClient(weather.Client()),
-		WithWeatherURL(weather.URL),
-		WithPlaceURL(place.URL),
-		WithNewsURL(news.URL),
-		WithRatesURL(rates.URL),
-		WithNewsQuota(denyQuota{}),
-	)
-
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
-
-	var data DashboardData
-	if err := json.NewDecoder(rec.Body).Decode(&data); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if newsHit {
-		t.Error("news upstream hit despite exhausted quota")
-	}
+	data := decodeDash(t, h)
 	m, ok := data.News.(map[string]interface{})
 	if !ok || m["status"] != "error" || m["code"] != "dailyQuotaExhausted" {
 		t.Errorf("News = %v, want dailyQuotaExhausted error object", data.News)
@@ -200,16 +168,6 @@ func TestServeHTTPNewsQuotaExhausted(t *testing.T) {
 }
 
 func TestServeHTTPNewsQuotaAllowed(t *testing.T) {
-	weather := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]interface{}{"weather": "ok"})
-	}))
-	defer weather.Close()
-
-	place := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]interface{}{"city": "Rome"})
-	}))
-	defer place.Close()
-
 	newsHit := false
 	news := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		newsHit = true
@@ -217,31 +175,9 @@ func TestServeHTTPNewsQuotaAllowed(t *testing.T) {
 	}))
 	defer news.Close()
 
-	rates := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"base":  "USD",
-			"rates": map[string]interface{}{"EUR": 0.9},
-		})
-	}))
-	defer rates.Close()
+	h := testDashboard(t, WithNewsURL(news.URL), WithNewsQuota(allowQuota{}))
 
-	h := New(
-		func(context.Context, string) string { return "" },
-		WithHTTPClient(weather.Client()),
-		WithWeatherURL(weather.URL),
-		WithPlaceURL(place.URL),
-		WithNewsURL(news.URL),
-		WithRatesURL(rates.URL),
-		WithNewsQuota(allowQuota{}),
-	)
-
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
-
-	var data DashboardData
-	if err := json.NewDecoder(rec.Body).Decode(&data); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
+	data := decodeDash(t, h)
 	if !newsHit {
 		t.Error("news upstream not hit despite available quota")
 	}
@@ -264,26 +200,216 @@ func TestServeHTTPAllFailures(t *testing.T) {
 	}))
 	defer fail.Close()
 
-	h := New(
-		func(context.Context, string) string { return "" },
-		WithHTTPClient(fail.Client()),
-		WithWeatherURL(fail.URL),
-		WithPlaceURL(fail.URL),
-		WithNewsURL(fail.URL),
-		WithRatesURL(fail.URL),
-	)
+	h := testDashboard(t, WithWeatherURL(fail.URL), WithPlaceURL(fail.URL), WithNewsURL(fail.URL), WithRatesURL(fail.URL))
 
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
-
-	var data DashboardData
-	if err := json.NewDecoder(rec.Body).Decode(&data); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
+	data := decodeDash(t, h)
 	if data.Error != "all upstream services failed" {
 		t.Errorf("Error = %q, want %q", data.Error, "all upstream services failed")
 	}
 	if len(data.MissingSecrets) != 0 {
 		t.Errorf("MissingSecrets = %v, want none", data.MissingSecrets)
 	}
+}
+
+// newsArticle is a minimal newsapi article for building upstream fixtures.
+func newsArticle(title, url, publishedAt string) map[string]interface{} {
+	return map[string]interface{}{
+		"title":       title,
+		"url":         url,
+		"publishedAt": publishedAt,
+		"source":      map[string]interface{}{"name": "Src"},
+	}
+}
+
+// newsArticles decodes the articles array from a served DashboardData.
+func newsArticles(t *testing.T, data DashboardData) []map[string]interface{} {
+	t.Helper()
+	m, ok := data.News.(map[string]interface{})
+	if !ok {
+		t.Fatalf("News is %T, want map", data.News)
+	}
+	raw, ok := m["articles"].([]interface{})
+	if !ok {
+		t.Fatalf("news.articles is %T, want []interface{}", m["articles"])
+	}
+	var out []map[string]interface{}
+	for _, a := range raw {
+		am, ok := a.(map[string]interface{})
+		if !ok {
+			t.Fatalf("article is %T, want map", a)
+		}
+		out = append(out, am)
+	}
+	return out
+}
+
+// memStore is an in-memory NewsStore mimicking the dedup + newest-first
+// behavior of the Redis-backed store, for tests that don't need Redis.
+type memStore struct {
+	mu    sync.Mutex
+	data  map[string]newsstore.Article
+	order []string
+}
+
+func newMemStore() *memStore {
+	return &memStore{data: map[string]newsstore.Article{}}
+}
+
+func (m *memStore) Store(_ context.Context, arts []newsstore.Article) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, a := range arts {
+		if a.URL == "" {
+			continue
+		}
+		if _, ok := m.data[a.URL]; ok {
+			continue
+		}
+		m.data[a.URL] = a
+		m.order = append(m.order, a.URL)
+	}
+	return nil
+}
+
+func (m *memStore) All(_ context.Context) ([]newsstore.Article, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]newsstore.Article, 0, len(m.order))
+	for i := len(m.order) - 1; i >= 0; i-- {
+		out = append(out, m.data[m.order[i]])
+	}
+	return out, nil
+}
+
+func TestServeHTTPNewsStoredAndDeduped(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	news := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		call := calls
+		mu.Unlock()
+		articles := []interface{}{
+			newsArticle("A", "https://x.com/a", "2026-08-01T00:00:00Z"),
+			newsArticle("B", "https://x.com/b", "2026-08-02T00:00:00Z"),
+		}
+		if call > 1 {
+			// Second fetch overlaps with the first: B returns again and must
+			// not duplicate or overwrite, while C is brand new.
+			articles = []interface{}{
+				newsArticle("B", "https://x.com/b", "2026-08-02T00:00:00Z"),
+				newsArticle("C", "https://x.com/c", "2026-08-03T00:00:00Z"),
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "articles": articles})
+	}))
+	defer news.Close()
+
+	store := newMemStore()
+	h := testDashboard(t, WithNewsURL(news.URL), WithNewsStore(store))
+
+	for i := 0; i < 2; i++ {
+		arts := newsArticles(t, decodeDash(t, h))
+		if len(arts) != i+2 {
+			t.Fatalf("request %d: %d articles, want %d", i+1, len(arts), i+2)
+		}
+		want := []string{"B", "C"}
+		if got := arts[0]["title"]; got != want[i] {
+			t.Errorf("request %d: newest title = %v, want %s", i+1, got, want[i])
+		}
+	}
+
+	arts := newsArticles(t, decodeDash(t, h))
+	if len(arts) != 3 {
+		t.Fatalf("after overlapping fetch: %d articles, want 3", len(arts))
+	}
+	want := []string{"C", "B", "A"}
+	for i, w := range want {
+		if got := arts[i]["title"]; got != w {
+			t.Errorf("article %d title = %v, want %s", i, got, w)
+		}
+	}
+}
+
+func TestServeHTTPNewsQuotaExhaustedServesStored(t *testing.T) {
+	newsHit := false
+	news := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		newsHit = true
+	}))
+	defer news.Close()
+
+	store := newMemStore()
+	store.Store(context.Background(), []newsstore.Article{{
+		Title:       "Stored",
+		URL:         "https://x.com/stored",
+		PublishedAt: "2026-08-02T00:00:00Z",
+		Source:      &newsstore.Source{Name: "Src"},
+	}})
+
+	h := testDashboard(t, WithNewsURL(news.URL), WithNewsQuota(denyQuota{}), WithNewsStore(store))
+
+	data := decodeDash(t, h)
+	if newsHit {
+		t.Error("news upstream hit despite exhausted quota")
+	}
+	arts := newsArticles(t, data)
+	if len(arts) != 1 {
+		t.Fatalf("articles = %d, want 1 from the store", len(arts))
+	}
+	if got := arts[0]["title"]; got != "Stored" {
+		t.Errorf("stored article title = %v, want Stored", got)
+	}
+}
+
+func TestServeHTTPNewsQuotaExhaustedEmptyStore(t *testing.T) {
+	news := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("news upstream hit despite exhausted quota")
+	}))
+	defer news.Close()
+
+	h := testDashboard(t, WithNewsURL(news.URL), WithNewsQuota(denyQuota{}), WithNewsStore(newMemStore()))
+
+	data := decodeDash(t, h)
+	m, ok := data.News.(map[string]interface{})
+	if !ok || m["status"] != "error" || m["code"] != "dailyQuotaExhausted" {
+		t.Errorf("News = %v, want dailyQuotaExhausted error object", data.News)
+	}
+}
+
+// testDashboard builds a Handler backed by throwaway httptest servers for the
+// weather/place/rates upstreams, plus any extra options. The news upstream is
+// provided by the caller via WithNewsURL.
+func testDashboard(t *testing.T, opts ...Option) *Handler {
+	t.Helper()
+	upstream := func(body string) *httptest.Server {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, body)
+		}))
+		t.Cleanup(s.Close)
+		return s
+	}
+	weather := upstream(`{"weather":"ok"}`)
+	place := upstream(`{"city":"Rome"}`)
+	rates := upstream(`{"base":"USD","rates":{"EUR":0.9}}`)
+	return New(
+		func(context.Context, string) string { return "" },
+		append([]Option{
+			WithHTTPClient(weather.Client()),
+			WithWeatherURL(weather.URL),
+			WithPlaceURL(place.URL),
+			WithRatesURL(rates.URL),
+		}, opts...)...,
+	)
+}
+
+// decodeDash serves one dashboard request and returns the decoded payload.
+func decodeDash(t *testing.T, h http.Handler) DashboardData {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
+	var data DashboardData
+	if err := json.NewDecoder(rec.Body).Decode(&data); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	return data
 }

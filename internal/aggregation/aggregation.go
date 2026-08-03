@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Ourobor0s3/ApiGate/internal/newsstore"
 	"github.com/Ourobor0s3/ApiGate/internal/quota"
 )
 
@@ -20,9 +21,10 @@ const (
 	// no WEATHER_API_URL / NEWS_API_URL override is set.
 	DefaultWeatherURL = "https://api.open-meteo.com/v1/forecast"
 	// DefaultNewsURL uses /v2/everything (popular English articles from all
-	// countries, not a single country's top headlines), capped at 20 so the
-	// dashboard doesn't pull the default 100-article payload.
-	DefaultNewsURL = "https://newsapi.org/v2/everything?language=en&sortBy=popularity&pageSize=20"
+	// countries, not a single country's top headlines), capped at 50 so the
+	// dashboard pulls a bounded payload; articles are persisted in the news
+	// store and replayed across requests.
+	DefaultNewsURL = "https://newsapi.org/v2/everything?language=en&sortBy=popularity&pageSize=50"
 
 	defaultPlaceURL = "https://api.bigdatacloud.net/data/reverse-geocode-client"
 	defaultRatesURL = "https://api.exchangerate-api.com/v4/latest"
@@ -50,6 +52,7 @@ type Handler struct {
 	logger     *slog.Logger
 	getSecret  func(context.Context, string) string
 	newsQuota  NewsQuota
+	newsStore  NewsStore
 	weatherURL string
 	newsURL    string
 	placeURL   string
@@ -61,6 +64,14 @@ type Handler struct {
 // disables the check.
 type NewsQuota interface {
 	Allow(ctx context.Context) (bool, error)
+}
+
+// NewsStore persists and replays newsapi articles so the dashboard can show
+// accumulated history instead of only the latest page. A nil store skips
+// persistence and the fresh page is returned as-is.
+type NewsStore interface {
+	Store(ctx context.Context, articles []newsstore.Article) error
+	All(ctx context.Context) ([]newsstore.Article, error)
 }
 
 type Option func(*Handler)
@@ -79,6 +90,10 @@ func WithNewsURL(u string) Option {
 
 func WithNewsQuota(q NewsQuota) Option {
 	return func(h *Handler) { h.newsQuota = q }
+}
+
+func WithNewsStore(s NewsStore) Option {
+	return func(h *Handler) { h.newsStore = s }
 }
 
 func WithPlaceURL(u string) Option {
@@ -122,7 +137,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.logger.Warn("dashboard: news quota check failed", "err", err)
 		case !allowed:
 			fetchNews = false
-			col.set("news", newsQuotaError())
+			// Spend no budget on the upstream, but the accumulated history is
+			// free: serve stored articles if we have any, else the error card.
+			news := interface{}(newsError(quota.ExhaustedCode, quota.ExhaustedMessage))
+			if h.newsStore != nil {
+				if all, err := h.newsStore.All(ctx); err == nil && len(all) > 0 {
+					news = newsResponseData(all)
+				}
+			}
+			col.set("news", news)
 		}
 	}
 
@@ -132,7 +155,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	go h.fetchJSON(ctx, col, "rates", h.ratesURLFor(ctx))
 	if fetchNews {
 		col.wg.Add(1)
-		go h.fetchJSON(ctx, col, "news", h.newsURLFor(ctx))
+		go h.fetchNews(ctx, col)
 	}
 	col.wg.Wait()
 
@@ -223,13 +246,13 @@ func parseLocation(location string) (float64, float64) {
 	return lat, lon
 }
 
-// newsQuotaError is a synthetic newsapi-style error object rendered as an
-// error card on the dashboard when the daily news budget is exhausted.
-func newsQuotaError() map[string]interface{} {
+// newsError builds a newsapi-style error object, rendered as an error card on
+// the dashboard for exhausted budgets and upstream key problems.
+func newsError(code, message string) map[string]interface{} {
 	return map[string]interface{}{
 		"status":  "error",
-		"code":    quota.ExhaustedCode,
-		"message": quota.ExhaustedMessage,
+		"code":    code,
+		"message": message,
 	}
 }
 
@@ -272,11 +295,7 @@ func (h *Handler) fetchJSON(ctx context.Context, col *collector, field, url stri
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		h.logger.Warn("dashboard: upstream returned error status", "field", field, "status", resp.StatusCode)
-		if field != "news" {
-			// Only news bodies are parsed on failure: newsapi reports key
-			// problems as a 200/4xx error object we need for MissingSecrets.
-			return
-		}
+		return
 	}
 
 	var data interface{}
@@ -288,6 +307,72 @@ func (h *Handler) fetchJSON(ctx context.Context, col *collector, field, url stri
 	col.set(field, data)
 }
 
+// fetchNews pulls the newsapi feed, persists articles in the news store and
+// replies with every stored article (newest first). Without a store the fresh
+// page is returned as-is. newsapi key problems are reported as their error
+// object so the dashboard can surface MissingSecrets.
+func (h *Handler) fetchNews(ctx context.Context, col *collector) {
+	defer col.wg.Done()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.newsURLFor(ctx), nil)
+	if err != nil {
+		h.logger.Warn("dashboard: invalid news URL", "err", err)
+		return
+	}
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		h.logger.Warn("dashboard: fetch failed", "field", "news", "err", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	if err != nil {
+		h.logger.Warn("dashboard: read body", "field", "news", "err", err)
+		return
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		h.logger.Warn("dashboard: news upstream returned error status", "status", resp.StatusCode)
+	}
+
+	var data struct {
+		Status   string              `json:"status"`
+		Code     string              `json:"code"`
+		Message  string              `json:"message"`
+		Articles []newsstore.Article `json:"articles"`
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		h.logger.Warn("dashboard: unmarshal news response", "err", err)
+		return
+	}
+
+	if data.Status == "error" {
+		col.set("news", newsError(data.Code, data.Message))
+		return
+	}
+
+	if h.newsStore != nil {
+		if err := h.newsStore.Store(ctx, data.Articles); err != nil {
+			h.logger.Warn("dashboard: store news", "err", err)
+		}
+		if all, err := h.newsStore.All(ctx); err == nil {
+			data.Articles = all
+		}
+	}
+	col.set("news", newsResponseData(data.Articles))
+}
+
+// newsResponseData wraps a stored article list in a newsapi-shaped response so
+// the frontend renderer keeps working unchanged.
+func newsResponseData(articles []newsstore.Article) map[string]interface{} {
+	return map[string]interface{}{
+		"status":       "ok",
+		"totalResults": len(articles),
+		"articles":     articles,
+	}
+}
+
 // collector merges concurrent upstream fetches into a single DashboardData.
 type collector struct {
 	mu  sync.Mutex
@@ -295,8 +380,8 @@ type collector struct {
 	res *DashboardData
 }
 
-// set writes field's value under the mutex. The "rates" and "place" fields
-// consume the raw JSON object instead of storing it wholesale.
+// set writes field's value under the mutex. The "place" field is special: it
+// stores the first non-empty locality string instead of the raw JSON object.
 func (c *collector) set(field string, v interface{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -306,9 +391,7 @@ func (c *collector) set(field string, v interface{}) {
 	case "news":
 		c.res.News = v
 	case "rates":
-		if m, ok := v.(map[string]interface{}); ok {
-			c.res.Rates = m
-		}
+		c.res.Rates = v
 	case "place":
 		if m, ok := v.(map[string]interface{}); ok {
 			for _, k := range []string{"city", "locality", "principalSubdivision"} {
