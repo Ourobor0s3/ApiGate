@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"strings"
 	"time"
 )
 
@@ -19,41 +18,63 @@ type Config struct {
 	NewsAPIKey func(context.Context) string
 }
 
-type route struct {
-	proxy *httputil.ReverseProxy
-}
-
+// Proxy holds the upstream reverse proxies. Route registration is exact on the
+// mux (GET /weather, GET /news), so no prefix matching is needed here.
 type Proxy struct {
-	routes map[string]*route
+	weather *httputil.ReverseProxy
+	news    *httputil.ReverseProxy
 }
 
 func New(cfg Config) (*Proxy, error) {
-	p := &Proxy{routes: make(map[string]*route)}
+	p := &Proxy{}
+	transport := newTransport()
 
 	var newsParams map[string]func(context.Context) string
 	if cfg.NewsAPIKey != nil {
 		newsParams = map[string]func(context.Context) string{"apiKey": cfg.NewsAPIKey}
 	}
 
-	if err := addRoute(p.routes, "/weather", cfg.WeatherAPI, nil); err != nil {
+	var err error
+	if p.weather, err = newReverseProxy("/weather", cfg.WeatherAPI, nil, transport); err != nil {
 		return nil, err
 	}
-	if err := addRoute(p.routes, "/news", cfg.NewsAPI, newsParams); err != nil {
+	if p.news, err = newReverseProxy("/news", cfg.NewsAPI, newsParams, transport); err != nil {
 		return nil, err
 	}
 	return p, nil
 }
 
-func addRoute(routes map[string]*route, prefix, target string, params map[string]func(context.Context) string) error {
+// Weather returns the /weather upstream handler, or http.NotFound when the
+// route has no target URL (empty WEATHER_API_URL).
+func (p *Proxy) Weather() http.Handler {
+	return handlerOrNotFound(p.weather)
+}
+
+// News returns the /news upstream handler, or http.NotFound when the route has
+// no target URL (empty NEWS_API_URL).
+func (p *Proxy) News() http.Handler {
+	return handlerOrNotFound(p.news)
+}
+
+func handlerOrNotFound(rp *httputil.ReverseProxy) http.Handler {
+	if rp == nil {
+		return http.HandlerFunc(http.NotFound)
+	}
+	return rp
+}
+
+// newReverseProxy builds a proxy for prefix; an empty target silently disables
+// the route (returns nil, nil) so the mux falls back to http.NotFound.
+func newReverseProxy(prefix, target string, params map[string]func(context.Context) string, transport http.RoundTripper) (*httputil.ReverseProxy, error) {
 	if target == "" {
-		return nil
+		return nil, nil
 	}
 	targetURL, err := url.Parse(target)
 	if err != nil {
-		return fmt.Errorf("invalid target URL for %s: %w", prefix, err)
+		return nil, fmt.Errorf("invalid target URL for %s: %w", prefix, err)
 	}
 
-	rp := &httputil.ReverseProxy{
+	return &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = targetURL.Scheme
 			req.URL.Host = targetURL.Host
@@ -72,26 +93,18 @@ func addRoute(routes map[string]*route, prefix, target string, params map[string
 				}
 			}
 		},
-		Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          20,
-			MaxIdleConnsPerHost:   10,
-			IdleConnTimeout:       30 * time.Second,
-			ResponseHeaderTimeout: 10 * time.Second,
-		},
-	}
-	routes[prefix] = &route{proxy: rp}
-	return nil
+		Transport: transport,
+	}, nil
 }
 
-func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	for prefix, rt := range p.routes {
-		if strings.HasPrefix(r.URL.Path, prefix) {
-			rt.proxy.ServeHTTP(w, r)
-			return
-		}
+func newTransport() http.RoundTripper {
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          20,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       30 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
 	}
-	http.NotFound(w, r)
 }

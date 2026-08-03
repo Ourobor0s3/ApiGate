@@ -31,9 +31,13 @@ go.work.sum
 dump.rdb
 appendonlydir/
 
+# local-only dev/release scripts
+scripts/
+
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+.DS_Store
 
 
 # opencode

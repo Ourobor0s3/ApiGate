@@ -38,7 +38,7 @@ Persistence files (`dump.rdb`, `appendonlydir/`) are written to the repo root an
 | News | [NewsAPI](https://newsapi.org) (`newsapi.org/v2/top-headlines`) | Yes (`NEWS_API_KEY`) |
 | Currency rates | [ExchangeRate-API](https://www.exchangerate-api.com) (`api.exchangerate-api.com/v4/latest/<base>`) | No |
 
-Weather and news URLs are overridable via env vars; the place-name and rates URLs are hardcoded. Rates are fetched live per dashboard request (the `/dashboard` page is never cached).
+Weather and news URLs are overridable via env vars (`WEATHER_API_URL`, `NEWS_API_URL`) — this applies to **both** the reverse-proxy routes and the dashboard aggregation; the place-name and rates URLs are hardcoded. Rates are fetched live per dashboard request (the `/dashboard` page is never cached).
 
 ## Getting an API key
 
@@ -85,18 +85,18 @@ Notes:
 ## Endpoints
 
 - `/` — dashboard UI (static HTML, not cached)
-- `/dashboard` — aggregated JSON: `weather` (+ `weatherPlace`, the reverse-geocoded place name), `news`, `rates`, plus `missingSecrets`/`error`. The weather card shows the location name; the currency card lists the **most popular currencies** against the base (EUR, GBP, JPY, CHF, CNY, RUB, …) in popularity order — not alphabetical. The served HTML page is sent with `Cache-Control: no-store` so updates are never stale.
+- `/dashboard` — aggregated JSON: `weather` (+ `weatherPlace`, the reverse-geocoded place name), `news`, `rates`, plus `missingSecrets`/`error`. The weather card shows the location name; the currency card lists the **most popular currencies** against the base (EUR, GBP, JPY, CHF, CNY, RUB, …) in popularity order — not alphabetical. The response is sent with `Cache-Control: no-store`, and the served HTML page too, so updates are never stale.
 - `/weather`, `/news` — reverse-proxied GETs (cached in Redis: 300s / 60s, rate-limited 100 req/min per IP)
 - `/api/secrets` — secret store: `GET` lists names (values never returned), `POST {name, value}` upserts, `DELETE ?name=` removes
 
 ## Architecture
 
-- `cmd/apigate` — wiring: mux → `cache.Middleware` → `ratelimit.Middleware` (rate limiting runs outside the cache).
-- `internal/proxy` — `httputil.ReverseProxy` per route; appends `apiKey` to `/news` from the secret store if missing.
+- `cmd/apigate` — composition root (`run()` + graceful shutdown: `signal.NotifyContext` → `http.Server.Shutdown` with a 10s timeout, server timeouts set); wiring: mux → `cache.Middleware` → `ratelimit.Middleware` (rate limiting runs outside the cache).
+- `internal/proxy` — `httputil.ReverseProxy` per upstream, exposed as `Proxy.Weather()` / `Proxy.News()`; appends `apiKey` to `/news` from the secret store if missing.
 - `internal/cache` — GET-only; custom binary serialization (2-byte status + headers + body), per-route TTLs.
 - `internal/ratelimit` — sliding window over a Redis ZSET per IP (`X-Forwarded-For` first value, else `RemoteAddr`).
-- `internal/aggregation` — `/dashboard` fans out 4 upstream fetches (weather, reverse-geocoded place name, news, rates) under a 10s timeout, resolving settings per request.
-- `internal/secrets` — Redis-backed key store (`secret:<name>`).
+- `internal/aggregation` — `/dashboard` fans out 4 upstream fetches (weather, reverse-geocoded place name, news, rates) under a 10s timeout, resolving settings per request. Dependencies (HTTP client, logger, upstream URLs) are injected via functional options.
+- `internal/secrets` — Redis-backed key store (`secret:<name>`), REST API wired with Go 1.22+ method routes on `/api/secrets`.
 
 ## Development
 
@@ -105,3 +105,5 @@ go build ./...
 go vet ./...
 go test ./...
 ```
+
+Unit tests for `proxy`, `cache`, `ratelimit`, `secrets` and `aggregation` run without a live Redis.
