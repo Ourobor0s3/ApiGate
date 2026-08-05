@@ -16,6 +16,8 @@ type Config struct {
 	// NewsAPIKey, if set, resolves an API key per request and appends it as
 	// the `apiKey` query param on the /news route when one isn't already set.
 	NewsAPIKey func(context.Context) string
+	// Breaker, if set, wraps each upstream transport in a circuit breaker.
+	Breaker BreakerConfig
 }
 
 // Proxy holds the upstream reverse proxies. Route registration is exact on the
@@ -35,10 +37,10 @@ func New(cfg Config) (*Proxy, error) {
 	}
 
 	var err error
-	if p.weather, err = newReverseProxy("/weather", cfg.WeatherAPI, nil, transport); err != nil {
+	if p.weather, err = newReverseProxy("/weather", cfg.WeatherAPI, nil, transport, cfg.Breaker); err != nil {
 		return nil, err
 	}
-	if p.news, err = newReverseProxy("/news", cfg.NewsAPI, newsParams, transport); err != nil {
+	if p.news, err = newReverseProxy("/news", cfg.NewsAPI, newsParams, transport, cfg.Breaker); err != nil {
 		return nil, err
 	}
 	return p, nil
@@ -65,13 +67,17 @@ func handlerOrNotFound(rp *httputil.ReverseProxy) http.Handler {
 
 // newReverseProxy builds a proxy for prefix; an empty target silently disables
 // the route (returns nil, nil) so the mux falls back to http.NotFound.
-func newReverseProxy(prefix, target string, params map[string]func(context.Context) string, transport http.RoundTripper) (*httputil.ReverseProxy, error) {
+func newReverseProxy(prefix, target string, params map[string]func(context.Context) string, transport http.RoundTripper, breaker BreakerConfig) (*httputil.ReverseProxy, error) {
 	if target == "" {
 		return nil, nil
 	}
 	targetURL, err := url.Parse(target)
 	if err != nil {
 		return nil, fmt.Errorf("invalid target URL for %s: %w", prefix, err)
+	}
+
+	if breaker.FailureThreshold > 0 {
+		transport = &breakerRoundTripper{next: transport, breaker: NewBreaker(breaker)}
 	}
 
 	return &httputil.ReverseProxy{
@@ -81,6 +87,13 @@ func newReverseProxy(prefix, target string, params map[string]func(context.Conte
 			req.URL.Path = targetURL.Path
 			req.URL.RawPath = ""
 			req.Host = targetURL.Host
+
+			// The gateway applies compression itself (the Gzip middleware), so
+			// ask the upstream for identity encoding. Otherwise the client's
+			// Accept-Encoding: gzip is forwarded upstream and the compressed
+			// bytes it returns would be cached (and later re-compressed by the
+			// outer gzip) as if they were the raw body.
+			req.Header.Set("Accept-Encoding", "identity")
 
 			// Merge query params baked into the target URL (e.g. ?country=us),
 			// letting the request's own params take precedence; then fill in any
@@ -100,6 +113,14 @@ func newReverseProxy(prefix, target string, params map[string]func(context.Conte
 				}
 			}
 			req.URL.RawQuery = rq.Encode()
+		},
+		// An upstream that ignores the identity request would otherwise leak a
+		// stale Content-Encoding into the cached body; strip it so downstream
+		// layers always see the raw representation.
+		ModifyResponse: func(resp *http.Response) error {
+			resp.Header.Del("Content-Encoding")
+			resp.Header.Del("Content-Length")
+			return nil
 		},
 		Transport: transport,
 	}, nil

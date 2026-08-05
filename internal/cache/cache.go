@@ -3,9 +3,11 @@ package cache
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -15,11 +17,29 @@ type Config struct {
 	DefaultTTL   int64
 	RouteTTLs    map[string]int64
 	NoCachePaths []string
+	// StaleWhileRevalidate, when > 0, lets a stale (expired) entry serve for up
+	// to this long while a background goroutine refreshes it, so repeated misses
+	// don't cascade to the upstream. Entries are stored with a TTL of
+	// ttl+StaleWhileRevalidate: past the base TTL Redis still holds them, and
+	// requests in that window get the stale copy plus an async refresh.
+	StaleWhileRevalidate time.Duration
 }
 
 type Cache struct {
-	rdb *redis.Client
+	rdb Redis
 	cfg Config
+
+	// mu guards refreshing; it dedups concurrent background refreshes of the
+	// same key so a burst of stale requests maps to a single upstream call.
+	mu         sync.Mutex
+	refreshing map[string]bool
+}
+
+// Redis is the narrow subset of the Redis client the cache needs, satisfied by
+// *redis.Client. Tests fake it to avoid a live Redis.
+type Redis interface {
+	Get(ctx context.Context, key string) *redis.StringCmd
+	Set(ctx context.Context, key string, value any, expiration time.Duration) *redis.StatusCmd
 }
 
 type cachedResponse struct {
@@ -28,8 +48,15 @@ type cachedResponse struct {
 	Body    []byte
 }
 
-func New(rdb *redis.Client, cfg Config) *Cache {
-	return &Cache{rdb: rdb, cfg: cfg}
+func New(rdb Redis, cfg Config) *Cache {
+	return &Cache{rdb: rdb, cfg: cfg, refreshing: make(map[string]bool)}
+}
+
+// storeTTL is how long an entry lives in Redis: the route TTL plus the stale
+// window, giving the SWR serving path a window to operate in. When
+// StaleWhileRevalidate is 0 the two collapse to the plain TTL.
+func (c *Cache) storeTTL(path string) time.Duration {
+	return time.Duration(c.ttlFor(path))*time.Second + c.cfg.StaleWhileRevalidate
 }
 
 func (c *Cache) Middleware(next http.Handler) http.Handler {
@@ -42,46 +69,137 @@ func (c *Cache) Middleware(next http.Handler) http.Handler {
 		key := cacheKey(r)
 		ctx := r.Context()
 
-		data, err := c.rdb.Get(ctx, key).Bytes()
-		if err == nil {
+		if data, err := c.rdb.Get(ctx, key).Bytes(); err == nil {
 			resp, derr := decodeResponse(data)
 			if derr == nil {
-				for k, v := range resp.Headers {
-					w.Header()[k] = v
+				if resp.Header("X-Fetched-At") != "" {
+					stale := isStale(resp, c.ttlFor(r.URL.Path))
+					if stale && c.cfg.StaleWhileRevalidate > 0 {
+						// Serve the stale copy now and refresh in the background
+						// (deduplicated so a burst shares one upstream call).
+						w.Header().Set("X-Cache", "STALE")
+						serveCached(w, resp)
+						c.refreshAsync(key, r, next)
+						return
+					}
 				}
-				w.WriteHeader(resp.Status)
-				_, _ = w.Write(resp.Body)
+				w.Header().Set("X-Cache", "HIT")
+				serveCached(w, resp)
 				return
 			}
 		}
 
+		w.Header().Set("X-Cache", "MISS")
 		cr := &captureResponse{ResponseWriter: w, buf: &bytes.Buffer{}}
 		next.ServeHTTP(cr, r)
 
 		if cr.code == 0 {
 			cr.code = http.StatusOK
 		}
-		if cr.code < 200 || cr.code >= 400 {
+		// Cache only successful responses: a 3xx that fell through (e.g. an
+		// inaccessible redirect) is not worth replaying to every caller.
+		if cr.code < 200 || cr.code >= 300 {
 			return
 		}
 
-		headers := storableHeaders(w.Header())
+		headers := storableHeaders(cr.Header())
+		headers.Set("X-Fetched-At", time.Now().UTC().Format(time.RFC3339))
 
 		resp := &cachedResponse{
 			Status:  cr.code,
 			Headers: headers,
 			Body:    cr.buf.Bytes(),
 		}
-		ttl := c.ttlFor(r.URL.Path)
-		c.rdb.Set(ctx, key, encodeResponse(resp), time.Duration(ttl)*time.Second)
+		if ttl := c.ttlFor(r.URL.Path); ttl > 0 {
+			c.rdb.Set(ctx, key, encodeResponse(resp), c.storeTTL(r.URL.Path))
+		}
 	})
 }
 
-// storableHeaders clones response headers, dropping the original Date so the
-// cached copy never serves a stale timestamp.
+// serveCached writes a cached response onto w without touching X-Cache state.
+func serveCached(w http.ResponseWriter, resp *cachedResponse) {
+	for k, v := range resp.Headers {
+		if k == "X-Fetched-At" {
+			continue
+		}
+		w.Header()[k] = v
+	}
+	w.WriteHeader(resp.Status)
+	_, _ = w.Write(resp.Body)
+}
+
+// isStale reports whether the entry is older than ttl. The cached entry carries
+// its fetch time in X-Fetched-At.
+func isStale(resp *cachedResponse, ttl int64) bool {
+	if ttl <= 0 {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339, resp.Header("X-Fetched-At"))
+	if err != nil {
+		return false
+	}
+	return time.Since(t) > time.Duration(ttl)*time.Second
+}
+
+// refresh re-fetches the origin for key and stores the result, so a stale
+// service can start from a warm cache without blocking the caller.
+func (c *Cache) refresh(key string, r *http.Request, next http.Handler) {
+	// A header-only capture lets the background fetch record upstream headers
+	// without a ResponseWriter; the request is cloned to decouple contexts.
+	h := make(http.Header)
+	cr := &captureResponse{Headers: h, buf: &bytes.Buffer{}}
+	next.ServeHTTP(cr, r.Clone(context.Background()))
+	if cr.code == 0 {
+		cr.code = http.StatusOK
+	}
+	// Mirror the MISS path: only successful responses are worth re-storing.
+	if cr.code < 200 || cr.code >= 300 {
+		return
+	}
+	h.Set("X-Fetched-At", time.Now().UTC().Format(time.RFC3339))
+	resp := &cachedResponse{Status: cr.code, Headers: storableHeaders(h), Body: cr.buf.Bytes()}
+	if c.ttlFor(r.URL.Path) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		c.rdb.Set(ctx, key, encodeResponse(resp), c.storeTTL(r.URL.Path))
+	}
+}
+
+// refreshAsync starts a background refresh of key, skipping it entirely when a
+// refresh of the same key is already in flight so a burst of stale requests
+// maps to a single upstream call instead of one per request.
+func (c *Cache) refreshAsync(key string, r *http.Request, next http.Handler) {
+	c.mu.Lock()
+	if c.refreshing[key] {
+		c.mu.Unlock()
+		return
+	}
+	c.refreshing[key] = true
+	c.mu.Unlock()
+
+	go func() {
+		defer func() {
+			c.mu.Lock()
+			delete(c.refreshing, key)
+			c.mu.Unlock()
+		}()
+		c.refresh(key, r, next)
+	}()
+}
+
+// Header returns the first value of the named header, or "".
+func (resp *cachedResponse) Header(name string) string { return resp.Headers.Get(name) }
+
+// storableHeaders clones response headers, dropping ones that are per-response
+// or would corrupt a cached copy: Date (stale timestamp), X-Cache (recomputed
+// on every serve), Content-Encoding and Content-Length (the stored body is the
+// raw uncompressed bytes, gzip is applied per-request outside the cache).
 func storableHeaders(h http.Header) http.Header {
 	clone := h.Clone()
 	clone.Del("Date")
+	clone.Del("X-Cache")
+	clone.Del("Content-Encoding")
+	clone.Del("Content-Length")
 	return clone
 }
 
@@ -101,28 +219,73 @@ func (c *Cache) ttlFor(path string) int64 {
 	return c.cfg.DefaultTTL
 }
 
+// keyPrefix namespaces every cached entry so unrelated Redis data never leaks
+// into the cache and vice versa.
+const keyPrefix = "cache:"
+
 func cacheKey(r *http.Request) string {
-	q := r.URL.RawQuery
-	if q != "" {
-		return "cache:" + r.Method + ":" + r.URL.Path + "?" + q
+	q := r.URL.Query()
+	// apiKey never belongs in the cache key: it's a per-request credential, not
+	// part of the cached resource, and leaking it into Redis keys would both
+	// embed a secret in long-lived data and fragment the cache per key value.
+	q.Del("apiKey")
+	// Values.Encode sorts keys, so equivalent requests with different parameter
+	// order share one entry.
+	if enc := q.Encode(); enc != "" {
+		return keyPrefix + r.Method + ":" + r.URL.Path + "?" + enc
 	}
-	return "cache:" + r.Method + ":" + r.URL.Path
+	return keyPrefix + r.Method + ":" + r.URL.Path
 }
 
+// captureResponse buffers the handler output so it can be cached or refreshed.
+// For the normal request path Header() returns the live writer's map so handler
+// headers reach the client; the refresh path (no ResponseWriter) uses an
+// explicit snapshot instead.
 type captureResponse struct {
 	http.ResponseWriter
-	buf  *bytes.Buffer
-	code int
+	buf     *bytes.Buffer
+	code    int
+	Headers http.Header
+}
+
+func (cr *captureResponse) Header() http.Header {
+	if cr.ResponseWriter != nil {
+		return cr.ResponseWriter.Header()
+	}
+	if cr.Headers != nil {
+		return cr.Headers
+	}
+	return make(http.Header)
 }
 
 func (cr *captureResponse) WriteHeader(code int) {
 	cr.code = code
-	cr.ResponseWriter.WriteHeader(code)
+	if cr.ResponseWriter != nil {
+		cr.ResponseWriter.WriteHeader(code)
+	}
 }
 
 func (cr *captureResponse) Write(b []byte) (int, error) {
 	cr.buf.Write(b)
-	return cr.ResponseWriter.Write(b)
+	if cr.ResponseWriter != nil {
+		return cr.ResponseWriter.Write(b)
+	}
+	return len(b), nil
+}
+
+// Flush lets wrapped handlers that advertise http.Flusher keep streaming
+// (e.g. SSE or chunked responses).
+func (cr *captureResponse) Flush() {
+	if cr.ResponseWriter != nil {
+		if f, ok := cr.ResponseWriter.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (cr *captureResponse) Unwrap() http.ResponseWriter {
+	return cr.ResponseWriter
 }
 
 func encodeResponse(resp *cachedResponse) []byte {

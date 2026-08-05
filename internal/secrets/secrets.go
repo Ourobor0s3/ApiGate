@@ -42,7 +42,10 @@ func (s *Store) List(ctx context.Context) ([]string, error) {
 	iter := s.rdb.Scan(ctx, 0, "secret:*", 0).Iterator()
 	names := make([]string, 0)
 	for iter.Next(ctx) {
-		names = append(names, strings.TrimPrefix(iter.Val(), "secret:"))
+		name := strings.TrimPrefix(iter.Val(), "secret:")
+		if validName.MatchString(name) {
+			names = append(names, name)
+		}
 	}
 	return names, iter.Err()
 }

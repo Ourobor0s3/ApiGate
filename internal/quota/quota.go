@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Ourobor0s3/ApiGate/internal/metrics"
+	"github.com/Ourobor0s3/ApiGate/internal/notify"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -19,6 +21,11 @@ type Config struct {
 	Name string
 	// Limit is the max number of requests allowed per local calendar day.
 	Limit int64
+	// OnExhausted, if set, is invoked when a request is rejected because the
+	// budget is spent. Use quota.ExhaustedNotifier for a deduplicated webhook.
+	OnExhausted func(ctx context.Context, name string)
+	// Metrics, if set, counts rejected requests under "quota_rejected".
+	Metrics *metrics.Store
 }
 
 // quotaKeyTTL gives the counter plenty of time to expire after midnight even
@@ -64,7 +71,56 @@ func (l *Limiter) Allow(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return n >= 0, nil
+	if n < 0 {
+		if l.cfg.OnExhausted != nil {
+			l.cfg.OnExhausted(ctx, l.cfg.Name)
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+// Usage returns how many upstream NewsAPI calls have been counted today.
+// Each call is one request against the daily limit, regardless of how many
+// articles that response contains. Used is 0 when none have been recorded yet.
+func (l *Limiter) Usage(ctx context.Context) (used, limit int64, err error) {
+	limit = l.cfg.Limit
+	used, err = l.rdb.Get(ctx, dayKey(l.cfg.Name, time.Now())).Int64()
+	if err == redis.Nil {
+		return 0, limit, nil
+	}
+	return used, limit, err
+}
+
+// ExhaustedNotifier returns an OnExhausted callback that posts a webhook at
+// most once per local calendar day per budget. The once-per-day guarantee comes
+// from a Redis SETNX key, so concurrent rejected requests can't spam the hook.
+// Returns nil when the client has no webhook URL configured.
+func ExhaustedNotifier(rdb *redis.Client, c *notify.Client) func(context.Context, string) {
+	if c == nil || !c.Enabled() {
+		return nil
+	}
+	return func(ctx context.Context, name string) {
+		day := time.Now().Format("2006-01-02")
+		key := notifyKey(name, day)
+		ok, err := rdb.SetNX(ctx, key, "1", quotaKeyTTL).Result()
+		if err != nil || !ok {
+			return
+		}
+		// Post fire-and-forget on a bounded background context: the webhook is
+		// a side effect and must not delay the 429 response, and the request
+		// context dies with the handler.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			c.Post(ctx, map[string]any{
+				"event":   "quotaExhausted",
+				"name":    name,
+				"date":    day,
+				"message": ExhaustedMessage,
+			})
+		}()
+	}
 }
 
 // Middleware returns 429 with a newsapi-style error body once the daily budget
@@ -77,6 +133,9 @@ func (l *Limiter) Middleware(next http.Handler) http.Handler {
 		if err != nil || allowed {
 			next.ServeHTTP(w, r)
 			return
+		}
+		if l.cfg.Metrics != nil {
+			l.cfg.Metrics.Incr("quota_rejected")
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", strconv.FormatInt(secondsUntilNextDay(time.Now()), 10))
@@ -93,6 +152,12 @@ func (l *Limiter) Middleware(next http.Handler) http.Handler {
 // "quota:news:2026-08-03".
 func dayKey(name string, t time.Time) string {
 	return "quota:" + name + ":" + t.Format("2006-01-02")
+}
+
+// notifyKey returns the once-per-day webhook dedup key for a budget, e.g.
+// "quota:notify:news:2026-08-03".
+func notifyKey(name, day string) string {
+	return "quota:notify:" + name + ":" + day
 }
 
 // secondsUntilNextDay reports how long until the daily counter rolls over,

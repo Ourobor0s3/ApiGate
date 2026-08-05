@@ -4,29 +4,26 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ApiGate Dashboard</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <div class="wrap">
   <header>
     <div>
-      <h1><span class="grad">ApiGate</span> Dashboard</h1>
-      <p class="subtitle">Aggregated view of the /weather, /news and /rates upstreams, proxied through this gateway.</p>
+      <h1><span class="grad">ApiGate</span> <span data-i18n="title.suffix">Dashboard</span></h1>
+      <p class="subtitle" data-i18n="header.subtitle">Weather, currency rates and top news — updated automatically.</p>
     </div>
     <div class="header-right">
+      <div class="lang-switch" role="group" aria-label="Language">
+        <button type="button" class="lang-btn" data-lang="en" aria-pressed="true">EN</button>
+        <button type="button" class="lang-btn" data-lang="ru" aria-pressed="false">RU</button>
+      </div>
       <span id="badge" class="badge loading">loading…</span>
-      <button id="refresh">Refresh<span class="spinner"></span></button>
     </div>
   </header>
 
-  <p class="meta">
-    <span id="meta">Loading data…</span>
-    <label class="autorefresh" title="Auto-refresh dashboard every 60s">
-      <input type="checkbox" id="autoRef" checked>
-      <span class="toggle"></span>
-      auto 60s
-    </label>
-  </p>
+  <p class="meta"><span id="meta" data-i18n="meta.initial">Loading…</span></p>
   <div id="errBanner" class="err-banner" hidden>
     <span>⚠️</span><span id="errText"></span>
   </div>
@@ -34,58 +31,66 @@
   <div class="dashboard">
     <div class="col">
       <section class="card" id="weatherCard">
-        <h2><span class="accent">🌤️</span> <span id="weatherTitle">Weather</span></h2>
-        <div id="weatherBody" class="empty">Loading…</div>
+        <h2><span class="accent">🌤️</span> <span id="weatherTitle" data-i18n="card.weather">Weather</span></h2>
+        <div id="weatherBody" class="empty">…</div>
       </section>
 
       <section class="card" id="ratesCard">
-        <h2><span class="accent">💱</span> Currency Rates</h2>
-        <div id="ratesBody" class="empty">Loading…</div>
+        <h2><span class="accent">💱</span> <span data-i18n="card.rates">Currency Rates</span></h2>
+        <div id="ratesBody" class="empty">…</div>
       </section>
     </div>
 
     <div class="col">
       <section class="card" id="newsCard">
-        <h2><span class="accent">📰</span> News</h2>
-        <p class="hint">Latest articles are fetched every refresh and kept in Redis for up to 4 days — no duplicates,
-          older stories remain reachable. Page through the full history below.</p>
-        <div id="newsBody" class="empty">Loading…</div>
+        <h2><span class="accent">📰</span> <span data-i18n="card.news">News</span>
+          <span class="news-head">
+            <span id="newsCount" class="news-count"></span>
+            <button type="button" class="neutral small" id="newsPrev" data-i18n="news.prev" disabled>← Prev</button>
+            <button type="button" class="neutral small" id="newsNext" data-i18n="news.next" disabled>Next →</button>
+          </span>
+        </h2>
+        <div id="newsBody" class="empty">…</div>
       </section>
     </div>
 
     <div class="col">
       <section class="card" id="checksCard">
-        <h2><span class="accent">📡</span> Site Checks
-          <button type="button" id="checkNow" class="neutral small" title="Probe every monitored site right now">
-            Check now<span class="spinner"></span>
-          </button>
+        <h2><span class="accent">📡</span> <span data-i18n="card.checks">Site Checks</span>
+          <button type="button" id="checkNow" class="neutral small"><span data-i18n="checks.now">Check now</span><span class="spinner"></span></button>
         </h2>
-        <p class="hint">Probe any URL and watch its reachability here. Checks run every <span id="checkInterval">5m</span>;
-          the interval is configurable via the <code>CHECK_INTERVAL</code> secret (e.g. <code>1m</code>, <code>6m 30s</code>).
-          Sites are identified by their hostname.</p>
+        <p class="hint"><span data-i18n="checks.hint">Monitored URLs are probed every</span> <span id="checkInterval" class="interval">5m</span>.</p>
         <form class="form-row" id="checkForm">
-          <input id="checkUrl" type="url" placeholder="https://example.com" required>
-          <button type="submit">Add</button>
+          <input id="checkUrl" type="url" data-i18n-ph="checks.urlPlaceholder" placeholder="https://example.com" required>
+          <button type="submit" data-i18n="checks.add">Add</button>
         </form>
         <ul class="checks" id="checkList"></ul>
+      </section>
+
+      <section class="card" id="quotaCard">
+        <h2><span class="accent">📬</span> <span data-i18n="card.quota">NewsAPI budget</span></h2>
+        <div class="quota-row">
+          <span data-i18n="quota.today">Requests today</span>
+          <b id="mNewsQuota">–</b>
+        </div>
+        <div class="progress"><span id="quotaBar" class="progress-fill"></span></div>
+        <p class="hint" id="mNewsQuotaHint"></p>
       </section>
     </div>
   </div>
 
-  <section class="card section-gap">
-    <h2><span class="accent">🔑</span> API Secrets</h2>
-    <p class="hint">Stored in Redis and applied automatically — no restart needed. Built-in names:
-      <code>NEWS_API_KEY</code> (news key), <code>WEATHER_LOCATION</code> (e.g. <code>55.75,37.62</code>), <code>MAIN_CURRENCY</code> (e.g. <code>EUR</code>).
-      Values are never shown back — only names.</p>
+  <section class="card section-gap" id="secretsCard">
+    <h2><span class="accent">🔑</span> <span data-i18n="card.secrets">API Secrets</span></h2>
     <form class="form-row" id="secretForm">
-      <input id="secretName" placeholder="Name (e.g. NEWS_API_KEY)" required>
-      <input id="secretValue" type="text" placeholder="Value" autocomplete="off" required>
-      <button type="submit">Save</button>
+      <input id="secretName" data-i18n-ph="secrets.namePlaceholder" placeholder="Name (e.g. NEWS_API_KEY)" required>
+      <input id="secretValue" type="text" data-i18n-ph="secrets.valuePlaceholder" placeholder="Value" autocomplete="off" required>
+      <button type="submit" data-i18n="secrets.save">Save</button>
     </form>
     <ul class="secrets" id="secretList"></ul>
   </section>
 </div>
 
+<script src="i18n.js" defer></script>
 <script src="app.js" defer></script>
 </body>
 </html>

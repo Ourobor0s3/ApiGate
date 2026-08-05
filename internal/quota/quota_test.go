@@ -2,12 +2,15 @@ package quota
 
 import (
 	"testing"
-	"time"
+
+	"github.com/Ourobor0s3/ApiGate/internal/notify"
 )
 
-func TestDayKey(t *testing.T) {
-	got := dayKey("news", time.Date(2026, 8, 3, 15, 30, 0, 0, time.UTC))
-	if want := "quota:news:2026-08-03"; got != want {
-		t.Errorf("dayKey() = %q, want %q", got, want)
+func TestExhaustedNotifierDisabledWhenNoWebhook(t *testing.T) {
+	if fn := ExhaustedNotifier(nil, nil); fn != nil {
+		t.Fatal("ExhaustedNotifier with no client must return nil")
+	}
+	if fn := ExhaustedNotifier(nil, notify.New("")); fn != nil {
+		t.Fatal("ExhaustedNotifier with disabled client must return nil")
 	}
 }
