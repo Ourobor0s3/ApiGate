@@ -68,7 +68,7 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 func TestShouldCache(t *testing.T) {
 	c := New(nil, Config{NoCachePaths: []string{"/dashboard", "/api/secrets", "/"}})
 
-	for _, path := range []string{"/dashboard", "/api/secrets", "/"} {
+	for _, path := range []string{"/dashboard", "/api/secrets", "/", "/assets/index-x.js", "/assets/x.css"} {
 		if c.shouldCache(path) {
 			t.Errorf("shouldCache(%q) = true, want false", path)
 		}
@@ -281,6 +281,37 @@ func TestStoreTTLIncludesSWR(t *testing.T) {
 	fake.mu.Unlock()
 	if want := 10*time.Second + 5*time.Minute; got != want {
 		t.Errorf("stored TTL = %v, want %v", got, want)
+	}
+}
+
+// TestOversizedBodyStreamedNotCached covers the maxCacheBody cap: the response
+// must reach the client in full but never be stored in Redis, so memory stays
+// bounded under many concurrent users.
+func TestOversizedBodyStreamedNotCached(t *testing.T) {
+	fake := newFakeRedis()
+	c := New(fake, Config{DefaultTTL: 300})
+	big := bytes.Repeat([]byte("x"), maxCacheBody+4096)
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(big)
+	})
+
+	rec := httptest.NewRecorder()
+	c.Middleware(next).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/weather", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), big) {
+		t.Errorf("client received %d bytes, want the full %d-byte body", rec.Body.Len(), len(big))
+	}
+
+	fake.mu.Lock()
+	writes := fake.writes
+	fake.mu.Unlock()
+	if writes != 0 {
+		t.Errorf("cache stored an oversized response: %d writes", writes)
 	}
 }
 

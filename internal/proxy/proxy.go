@@ -1,12 +1,16 @@
 package proxy
 
 import (
+	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -114,16 +118,64 @@ func newReverseProxy(prefix, target string, params map[string]func(context.Conte
 			}
 			req.URL.RawQuery = rq.Encode()
 		},
-		// An upstream that ignores the identity request would otherwise leak a
-		// stale Content-Encoding into the cached body; strip it so downstream
-		// layers always see the raw representation.
+		// An upstream that ignores the identity request would otherwise leak
+		// a stale Content-Encoding into the body; every downstream layer
+		// (cache, gzip) assumes the body is the raw representation, so any
+		// compression is undone here.
 		ModifyResponse: func(resp *http.Response) error {
-			resp.Header.Del("Content-Encoding")
-			resp.Header.Del("Content-Length")
-			return nil
+			return decodeBody(resp)
 		},
 		Transport: transport,
 	}, nil
+}
+
+// decodeBody unwraps an upstream response back to its raw representation.
+// The gateway asks for `Accept-Encoding: identity` and caches the returned
+// bytes as-is, so a misbehaving upstream that compresses anyway would have its
+// compressed bytes stored and served to clients as if they were the raw body.
+// Only the declared encoding is removed; unknown or already-decompressed
+// bodies pass through untouched.
+func decodeBody(resp *http.Response) error {
+	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	switch enc {
+	case "":
+		return nil
+	case "gzip", "x-gzip":
+		zr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return err
+		}
+		resp.Body = &readCloser{Reader: zr, closer: resp.Body}
+	case "deflate":
+		zr, err := zlib.NewReader(resp.Body)
+		if err != nil {
+			return err
+		}
+		resp.Body = &readCloser{Reader: zr, closer: resp.Body}
+	default:
+		// "identity", "br", "compress" and anything else: keep the body wired
+		// through unchanged rather than risk mislabeling it.
+		if enc == "identity" {
+			resp.Header.Del("Content-Encoding")
+		}
+		return nil
+	}
+	resp.Header.Del("Content-Encoding")
+	resp.Header.Del("Content-Length")
+	resp.ContentLength = -1
+	return nil
+}
+
+// readCloser pairs a decompressing reader with the upstream body it is reading
+// from, so the underlying connection is still closed when the response is
+// consumed.
+type readCloser struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (rc *readCloser) Close() error {
+	return rc.closer.Close()
 }
 
 func newTransport() http.RoundTripper {

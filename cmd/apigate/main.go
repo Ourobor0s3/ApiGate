@@ -2,11 +2,10 @@ package main
 
 import (
 	"context"
-	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -19,7 +18,6 @@ import (
 	"github.com/Ourobor0s3/ApiGate/internal/aggregation"
 	"github.com/Ourobor0s3/ApiGate/internal/cache"
 	"github.com/Ourobor0s3/ApiGate/internal/checks"
-	"github.com/Ourobor0s3/ApiGate/internal/metrics"
 	"github.com/Ourobor0s3/ApiGate/internal/middleware"
 	"github.com/Ourobor0s3/ApiGate/internal/newsstore"
 	"github.com/Ourobor0s3/ApiGate/internal/notify"
@@ -29,9 +27,6 @@ import (
 	"github.com/Ourobor0s3/ApiGate/internal/secrets"
 	"github.com/redis/go-redis/v9"
 )
-
-//go:embed static
-var staticFS embed.FS
 
 func main() {
 	if err := run(context.Background()); err != nil {
@@ -73,26 +68,20 @@ func run(ctx context.Context) error {
 		return os.Getenv(name)
 	}
 
-	// Raw os.Getenv (not envOrDefault): an explicitly empty value is the way
-	// to disable the proxy route while keeping the dashboard on its built-in
-	// default upstreams.
+	// newsUpstream defaults: the dashboard keeps its built-in default
+	// upstreams even when the env var is set empty to disable the public
+	// proxy route. Each may be overridden at runtime via a Redis secret of
+	// the same name (poll-time), which the aggregation layer resolves.
 	weatherAPI := os.Getenv("WEATHER_API_URL")
-	newsAPI := os.Getenv("NEWS_API_URL")
+	newsAPIUpstreamEnv := os.Getenv("NEWS_API_URL")
+	newsURL := envOrDefault("NEWS_API_URL", aggregation.DefaultNewsURL)
+	newsURLRU := envOrDefault("NEWS_API_URL_RU", aggregation.DefaultNewsURLRU)
 
 	webhook := notify.New(os.Getenv("WEBHOOK_URL"))
-	metricsStore := metrics.New(rdb)
-
-	// Counters used to live under undated keys (metric:http_2xx); drop any
-	// leftovers so old numbers can't show up as "today".
-	for _, name := range metrics.NamedCounters() {
-		if err := rdb.Del(ctx, metrics.KeyPrefix+name).Err(); err != nil {
-			logger.Warn("metrics: legacy counter cleanup failed", "name", name, "err", err)
-		}
-	}
 
 	p, err := proxy.New(proxy.Config{
 		WeatherAPI: weatherAPI,
-		NewsAPI:    newsAPI,
+		NewsAPI:    newsAPIUpstreamEnv,
 		NewsAPIKey: func(ctx context.Context) string { return getSecret(ctx, "NEWS_API_KEY") },
 		Breaker: proxy.BreakerConfig{
 			FailureThreshold: envIntOrDefault("UPSTREAM_BREAK_FAILURES", 5),
@@ -106,7 +95,7 @@ func run(ctx context.Context) error {
 	c := cache.New(rdb, cache.Config{
 		DefaultTTL:   300,
 		RouteTTLs:    map[string]int64{"/weather": 300, "/news": 60},
-		NoCachePaths: []string{"/dashboard", "/api/secrets", "/api/checks", "/api/metrics", "/style.css", "/app.js", "/", "/healthz"},
+		NoCachePaths: []string{"/dashboard", "/api/secrets", "/api/checks", "/api/newsquota", "/", "/healthz"},
 		// Stale-while-revalidate: serve a stale cached copy for up to 10
 		// minutes past its TTL while refreshing in the background, so a cold
 		// cache never cascades to the upstream.
@@ -132,18 +121,23 @@ func run(ctx context.Context) error {
 		Name:        "news",
 		Limit:       envInt64OrDefault("NEWS_DAILY_LIMIT", 100),
 		OnExhausted: quota.ExhaustedNotifier(rdb, webhook),
-		Metrics:     metricsStore,
 	})
 
 	agg := aggregation.New(getSecret,
-		// The dashboard keeps its built-in default upstreams even when the env
-		// var is set empty to disable the public proxy route.
+		// The dashboard keeps its built-in default upstreams (or the env
+		// override) even when the env var is set empty to disable the public
+		// proxy route. NEWS_API_URL/NEWS_API_URL_RU additionally resolve a
+		// Redis secret of the same name at request/poll time.
 		aggregation.WithWeatherURL(envOrDefault("WEATHER_API_URL", aggregation.DefaultWeatherURL)),
-		aggregation.WithNewsURL(envOrDefault("NEWS_API_URL", aggregation.DefaultNewsURL)),
-		aggregation.WithNewsURLRU(envOrDefault("NEWS_API_URL_RU", aggregation.DefaultNewsURLRU)),
+		aggregation.WithNewsURL(newsURL),
+		aggregation.WithNewsURLRU(newsURLRU),
 		aggregation.WithNewsQuota(newsQuota),
 		aggregation.WithNewsStore(newsstore.New(rdb)),
 		aggregation.WithNewsStoreRU(newsstore.NewLang(rdb, "ru")),
+		// The weather/place/rates snapshots live in Redis too: the dashboard
+		// reads them per request and the poller refreshes them on the news
+		// cycle, so no dashboard request ever spends an upstream budget.
+		aggregation.WithKV(snapshotStore{rdb}),
 		aggregation.WithNewsPollInterval(func(ctx context.Context) time.Duration {
 			return aggregation.ParseInterval(getSecret(ctx, "NEWS_POLL_INTERVAL"))
 		}),
@@ -177,26 +171,36 @@ func run(ctx context.Context) error {
 		AllowPrivate: envBoolOrDefault("CHECKS_ALLOW_PRIVATE", false),
 	})
 
-	staticSub, err := fs.Sub(staticFS, "static")
-	if err != nil {
-		return err
-	}
-
 	mux := http.NewServeMux()
 	mux.Handle("GET /weather", p.Weather())
 	mux.Handle("GET /news", newsQuota.Middleware(p.News()))
 	mux.Handle("GET /dashboard", agg)
 	mux.Handle("GET /healthz", middleware.Health(rdb, logger))
-	mux.Handle("GET /api/metrics", metricsHandler(metricsStore, newsQuota))
-	secrets.NewHandler(store).Register(mux)
+	mux.Handle("GET /api/newsquota", newsQuotaHandler(newsQuota))
+	secrets.NewHandler(store, []secrets.Setting{
+		// Every runtime-configurable variable, with its default/environment
+		// value, surfaced on the API Secrets page for the UI.
+		{Name: "NEWS_API_KEY", Masked: true},
+		{Name: "WEATHER_LOCATION", Default: "55.7558,37.6173", Env: os.Getenv("WEATHER_LOCATION")},
+		{Name: "MAIN_CURRENCY", Default: "USD", Env: os.Getenv("MAIN_CURRENCY")},
+		{Name: "NEWS_POLL_INTERVAL", Default: "60m", Env: os.Getenv("NEWS_POLL_INTERVAL")},
+		{Name: "CHECK_INTERVAL", Default: "5m", Env: os.Getenv("CHECK_INTERVAL")},
+		{Name: "NEWS_API_URL", Default: newsURL, Env: newsAPIUpstreamEnv},
+		{Name: "NEWS_API_URL_RU", Default: newsURLRU, Env: os.Getenv("NEWS_API_URL_RU")},
+	}, secrets.WithOnChange(func(name string) {
+		// A data-affecting secret must reflect on the dashboard right away:
+		// fire one out-of-cycle refresh instead of waiting for the next poll.
+		if refreshOnSecret(name) {
+			agg.PollNow()
+		}
+	})).Register(mux)
 	checks.NewHandler(chk).Register(mux)
-	mux.Handle("GET /", noCache(http.FileServer(http.FS(staticSub))))
+	mux.Handle("GET /", noCache(uiHandler(logger)))
 
 	var h http.Handler = mux
 	h = c.Middleware(h)
 	h = rl.Middleware(h)
 	h = middleware.Recover(logger, h)
-	h = metricsStore.Middleware(h)
 	h = middleware.Gzip(h)
 	h = middleware.SecureHeaders(os.Getenv("CORS_ORIGIN"))(h)
 	h = middleware.RequestLogger(logger, clientIP, h)
@@ -250,16 +254,71 @@ func noCache(next http.Handler) http.Handler {
 	})
 }
 
-// metricsHandler serves HTTP status counters plus today's NewsAPI budget usage.
-func metricsHandler(store *metrics.Store, newsQuota *quota.Limiter) http.Handler {
+// uiHandler serves the built SPA from frontend/dist (gitignored build output)
+// when present, and a stub page otherwise. The UI is not embedded anymore:
+// run `npm run build` in frontend/ before `go run` to avoid the stub.
+func uiHandler(logger *slog.Logger) http.Handler {
+	const dir = "frontend/dist"
+	if info, err := os.Stat(dir); err == nil && info.IsDir() {
+		return http.FileServer(http.Dir(dir))
+	}
+	logger.Warn("frontend/dist not found — UI not built (run `cd frontend && npm run build`)")
+	return http.HandlerFunc(stubHandler)
+}
+
+const stubPage = `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>ApiGate</title>
+<style>body{margin:0;font:14px/1.6 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;background:#f5f6f9;color:#303238;display:grid;place-items:center;height:100vh}
+.card{background:#fff;border:1px solid #d9dce3;border-radius:4px;padding:28px 36px;text-align:center}
+h1{font-size:18px;margin:0 0 8px}code{font-family:ui-monospace,Menlo,monospace;font-size:13px;background:#f5f6f9;border:1px solid #d9dce3;border-radius:3px;padding:2px 6px}
+p{color:#6b7280;margin:8px 0 0}</style></head>
+<body><div class="card"><h1>ApiGate UI is not built</h1>
+<p>Run <code>cd frontend &amp;&amp; npm run build</code> and start the server again.</p></div></body></html>`
+
+func stubHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	io.WriteString(w, stubPage)
+}
+
+// snapshotStore adapts *redis.Client to aggregation.Store for the dashboard's
+// weather/place/rates snapshots. A missing key surfaces as an empty value
+// (redis.Nil is the normal "not polled yet" case, not an error worth logging).
+type snapshotStore struct{ rdb *redis.Client }
+
+func (s snapshotStore) Get(ctx context.Context, key string) (string, error) {
+	v, err := s.rdb.Get(ctx, key).Result()
+	if err == redis.Nil {
+		return "", nil
+	}
+	return v, err
+}
+
+func (s snapshotStore) Set(ctx context.Context, key, value string, ttl time.Duration) error {
+	return s.rdb.Set(ctx, key, value, ttl).Err()
+}
+
+// refreshOnSecret reports whether a changed secret invalidates served data.
+// A new location, currency, news upstream or API key must show up on the
+// dashboard immediately, so writes to these names trigger an immediate
+// background refresh; schedule-only settings (NEWS_POLL_INTERVAL,
+// CHECK_INTERVAL) pick up on their next cycle on their own.
+func refreshOnSecret(name string) bool {
+	switch name {
+	case "NEWS_API_KEY", "WEATHER_LOCATION", "MAIN_CURRENCY":
+		return true
+	}
+	return false
+}
+
+// newsQuotaHandler serves today's NewsAPI budget usage for the dashboard's
+// budget bar: the quota limiter state, not per-request metrics.
+func newsQuotaHandler(newsQuota *quota.Limiter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 
-		out := make(map[string]int64, len(metrics.NamedCounters())+2)
-		for k, v := range store.Values(ctx) {
-			out[k] = v
-		}
+		out := make(map[string]int64, 2)
 		if used, limit, err := newsQuota.Usage(ctx); err == nil {
 			out["news_quota_used"] = used
 			out["news_quota_limit"] = limit

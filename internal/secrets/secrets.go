@@ -12,6 +12,11 @@ import (
 
 var validName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
+// maxSecretValue caps a stored secret (API keys, URLs, intervals are all a few
+// hundred bytes at most), so one bad write can't plant a huge value that every
+// request would then re-read into memory.
+const maxSecretValue = 8 << 10
+
 type Store struct {
 	rdb *redis.Client
 }
@@ -40,7 +45,7 @@ func (s *Store) Delete(ctx context.Context, name string) error {
 
 func (s *Store) List(ctx context.Context) ([]string, error) {
 	iter := s.rdb.Scan(ctx, 0, "secret:*", 0).Iterator()
-	names := make([]string, 0)
+	var names []string
 	for iter.Next(ctx) {
 		name := strings.TrimPrefix(iter.Val(), "secret:")
 		if validName.MatchString(name) {
@@ -50,14 +55,53 @@ func (s *Store) List(ctx context.Context) ([]string, error) {
 	return names, iter.Err()
 }
 
-// Handler exposes the store as a small REST API. Values are never returned in
-// responses — only secret names are listed.
-type Handler struct {
-	store *Store
+// storer is the narrow store surface the REST handler needs. *Store satisfies
+// it; tests substitute an in-memory fake, keeping the handler Redis-free.
+type storer interface {
+	Get(ctx context.Context, name string) (string, error)
+	Set(ctx context.Context, name, value string) error
+	Delete(ctx context.Context, name string) error
+	List(ctx context.Context) ([]string, error)
 }
 
-func NewHandler(s *Store) *Handler {
-	return &Handler{store: s}
+// Setting describes one runtime-configurable variable shown on the API
+// Secrets page: its built-in default and the env value (if set). A stored
+// Redis secret of the same name overrides both; Masked names never have their
+// value returned (api keys).
+type Setting struct {
+	Name    string
+	Default string
+	Env     string
+	Masked  bool
+}
+
+// Option configures a Handler.
+type Option func(*Handler)
+
+// WithOnChange registers a callback fired after a secret is created or
+// deleted — never on read or on a rejected write. main uses it to trigger an
+// immediate data refresh when a data-affecting secret changes, so the
+// dashboard reflects the new location, currency or news upstream without
+// waiting for the next scheduled poll.
+func WithOnChange(f func(string)) Option {
+	return func(h *Handler) { h.onChange = f }
+}
+
+// Handler exposes the store as a small REST API. Values are never returned in
+// responses — only secret names are listed, plus the known settings catalog
+// (with defaults) so the UI can offer every changeable variable in one place.
+type Handler struct {
+	store    storer
+	settings []Setting
+	onChange func(string)
+}
+
+func NewHandler(s storer, settings []Setting, opts ...Option) *Handler {
+	h := &Handler{store: s, settings: settings}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 // Register wires the GET/POST/DELETE routes on /api/secrets. Method and path
@@ -74,8 +118,36 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	stored := make(map[string]bool, len(names))
+	for _, n := range names {
+		stored[n] = true
+	}
+
+	// A stored secret only surfaces its value when it is not masked; masked
+	// names (api keys) come back with Stored=true so the UI can show that a
+	// value is set without revealing it.
+	settings := make([]map[string]interface{}, 0, len(h.settings))
+	for _, s := range h.settings {
+		row := map[string]interface{}{
+			"name":    s.Name,
+			"default": s.Default,
+			"stored":  stored[s.Name],
+			"masked":  s.Masked,
+		}
+		if !s.Masked {
+			if s.Env != "" {
+				row["env"] = s.Env
+			}
+			if v, err := h.store.Get(r.Context(), s.Name); err == nil && v != "" {
+				row["value"] = v
+			}
+		}
+		settings = append(settings, row)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"secrets": names})
+	json.NewEncoder(w).Encode(map[string]interface{}{"secrets": names, "settings": settings})
 }
 
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
@@ -92,9 +164,16 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name must match [A-Za-z0-9_-]+ and value must be non-empty", http.StatusBadRequest)
 		return
 	}
+	if len(in.Value) > maxSecretValue {
+		http.Error(w, "value too long (max 8 KiB)", http.StatusBadRequest)
+		return
+	}
 	if err := h.store.Set(r.Context(), in.Name, in.Value); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if h.onChange != nil {
+		h.onChange(in.Name)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -108,6 +187,9 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 	if err := h.store.Delete(r.Context(), name); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if h.onChange != nil {
+		h.onChange(name)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Ourobor0s3/ApiGate/internal/netguard"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -45,6 +47,12 @@ const historyLimit = 100
 // older than this are pruned by score on every write and read, so records of
 // two days ago are deleted automatically without a background sweeper.
 const historyWindow = 48 * time.Hour
+
+// checkDrainBytes is how much of a probe response body is read before the
+// connection is closed. Draining a small slice lets the transport reuse the
+// keep-alive connection; anything larger is cut off so a huge body can't be
+// transferred in full on every probe.
+const checkDrainBytes = 64 << 10
 
 // targetsKey is a Redis SET of the URLs to probe.
 const targetsKey = "check:targets"
@@ -135,7 +143,7 @@ func guardedDialContext(base *net.Dialer) func(ctx context.Context, network, add
 		}
 		if ips, err := net.LookupIP(host); err == nil {
 			for _, ip := range ips {
-				if blockedIP(ip) {
+				if netguard.BlockedIP(ip) {
 					return nil, ErrPrivateAddress
 				}
 			}
@@ -211,17 +219,11 @@ func guardPublicAddress(ctx context.Context, rawurl string) error {
 		return nil
 	}
 	for _, ip := range ips {
-		if blockedIP(ip) {
+		if netguard.BlockedIP(ip) {
 			return ErrPrivateAddress
 		}
 	}
 	return nil
-}
-
-// blockedIP reports whether an IP is loopback, private, link-local or
-// unspecified — the ranges the SSRF guard rejects.
-func blockedIP(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
 }
 
 // List returns all targets (sorted by display name) and the current interval.
@@ -381,11 +383,15 @@ func (c *Checks) checkOne(ctx context.Context, rawurl string) {
 	start := time.Now()
 	resp, err := c.httpClient.Do(req)
 	latency := time.Since(start).Milliseconds()
+	at := time.Now()
 
-	s := Status{CheckedAt: time.Now().UTC().Format(time.RFC3339)}
+	s := Status{CheckedAt: at.UTC().Format(time.RFC3339)}
 	if err != nil {
 		c.logger.Warn("checks: request failed", "url", rawurl, "err", err)
 	} else {
+		// Drain a bounded slice so the keep-alive connection is reusable for
+		// the next probe instead of being discarded unused.
+		_, _ = io.CopyN(io.Discard, resp.Body, checkDrainBytes)
 		resp.Body.Close()
 		s.OK = resp.StatusCode >= 200 && resp.StatusCode < 400
 		s.Code = resp.StatusCode
@@ -396,7 +402,9 @@ func (c *Checks) checkOne(ctx context.Context, rawurl string) {
 	if err != nil {
 		return
 	}
-	if !c.storeStatus(ctx, rawurl, b, time.Now()) {
+	// One timestamp for the record and its history score: the ZSET orders by
+	// score, so the two must never disagree (e.g. across a midnight boundary).
+	if !c.storeStatus(ctx, rawurl, b, at) {
 		return
 	}
 

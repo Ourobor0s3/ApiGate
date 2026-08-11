@@ -1,6 +1,7 @@
 package newsstore
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,5 +58,20 @@ func TestPublishedScore(t *testing.T) {
 	got := publishedScore(Article{PublishedAt: "garbage"})
 	if d := time.Since(time.Unix(got, 0)); d < -5*time.Second || d > 5*time.Second {
 		t.Errorf("publishedScore(unparseable) = %d, want ~now", got)
+	}
+}
+
+func TestStorableArticlesSkipsOversized(t *testing.T) {
+	normal := Article{URL: "https://x.com/a", Title: "A"}
+	huge := Article{URL: "https://x.com/b", Title: "B", Content: strings.Repeat("x", maxArticleBytes)}
+	noURL := Article{Title: "no url"}
+	badURL := Article{URL: "", Title: "also no url"}
+
+	got := storableArticles([]Article{normal, huge, noURL, badURL})
+	if len(got) != 1 {
+		t.Fatalf("storableArticles() kept %d articles, want 1 (the normal one)", len(got))
+	}
+	if got[0].id != articleID(normal.URL) {
+		t.Errorf("kept article id = %q, want %q", got[0].id, articleID(normal.URL))
 	}
 }

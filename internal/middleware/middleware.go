@@ -74,7 +74,7 @@ func isTrustedPeer(remoteAddr string, blocks []*net.IPNet) bool {
 }
 
 // StatusRecorder wraps a ResponseWriter to capture the response status code and
-// body size for logging and metrics.
+// body size for logging.
 type StatusRecorder struct {
 	http.ResponseWriter
 	Status int

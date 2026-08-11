@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Ourobor0s3/ApiGate/internal/metrics"
 	"github.com/Ourobor0s3/ApiGate/internal/notify"
 	"github.com/redis/go-redis/v9"
 )
@@ -24,8 +23,6 @@ type Config struct {
 	// OnExhausted, if set, is invoked when a request is rejected because the
 	// budget is spent. Use quota.ExhaustedNotifier for a deduplicated webhook.
 	OnExhausted func(ctx context.Context, name string)
-	// Metrics, if set, counts rejected requests under "quota_rejected".
-	Metrics *metrics.Store
 }
 
 // quotaKeyTTL gives the counter plenty of time to expire after midnight even
@@ -133,9 +130,6 @@ func (l *Limiter) Middleware(next http.Handler) http.Handler {
 		if err != nil || allowed {
 			next.ServeHTTP(w, r)
 			return
-		}
-		if l.cfg.Metrics != nil {
-			l.cfg.Metrics.Incr("quota_rejected")
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", strconv.FormatInt(secondsUntilNextDay(time.Now()), 10))

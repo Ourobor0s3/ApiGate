@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -97,8 +98,9 @@ func (c *Cache) Middleware(next http.Handler) http.Handler {
 			cr.code = http.StatusOK
 		}
 		// Cache only successful responses: a 3xx that fell through (e.g. an
-		// inaccessible redirect) is not worth replaying to every caller.
-		if cr.code < 200 || cr.code >= 300 {
+		// inaccessible redirect) is not worth replaying to every caller, and an
+		// oversized body was streamed but never buffered.
+		if cr.code < 200 || cr.code >= 300 || cr.overflow {
 			return
 		}
 
@@ -142,32 +144,39 @@ func isStale(resp *cachedResponse, ttl int64) bool {
 }
 
 // refresh re-fetches the origin for key and stores the result, so a stale
-// service can start from a warm cache without blocking the caller.
+// service can start from a warm cache without blocking the caller. The work
+// runs on a bounded background context: a hung upstream or Redis must not
+// leave the goroutine alive forever.
 func (c *Cache) refresh(key string, r *http.Request, next http.Handler) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	r = r.Clone(ctx)
 	// A header-only capture lets the background fetch record upstream headers
-	// without a ResponseWriter; the request is cloned to decouple contexts.
+	// without a ResponseWriter.
 	h := make(http.Header)
 	cr := &captureResponse{Headers: h, buf: &bytes.Buffer{}}
-	next.ServeHTTP(cr, r.Clone(context.Background()))
+	next.ServeHTTP(cr, r)
 	if cr.code == 0 {
 		cr.code = http.StatusOK
 	}
-	// Mirror the MISS path: only successful responses are worth re-storing.
-	if cr.code < 200 || cr.code >= 300 {
+	// Mirror the MISS path: only successful, bounded responses are worth
+	// re-storing.
+	if cr.code < 200 || cr.code >= 300 || cr.overflow {
 		return
 	}
 	h.Set("X-Fetched-At", time.Now().UTC().Format(time.RFC3339))
 	resp := &cachedResponse{Status: cr.code, Headers: storableHeaders(h), Body: cr.buf.Bytes()}
 	if c.ttlFor(r.URL.Path) > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
 		c.rdb.Set(ctx, key, encodeResponse(resp), c.storeTTL(r.URL.Path))
 	}
 }
 
 // refreshAsync starts a background refresh of key, skipping it entirely when a
 // refresh of the same key is already in flight so a burst of stale requests
-// maps to a single upstream call instead of one per request.
+// maps to a single upstream call instead of one per request. Panics inside the
+// refresh chain are contained: the cache sits inside the Recover middleware,
+// but this goroutine calls the chain below the cache directly, so nothing else
+// would catch them.
 func (c *Cache) refreshAsync(key string, r *http.Request, next http.Handler) {
 	c.mu.Lock()
 	if c.refreshing[key] {
@@ -178,6 +187,11 @@ func (c *Cache) refreshAsync(key string, r *http.Request, next http.Handler) {
 	c.mu.Unlock()
 
 	go func() {
+		defer func() {
+			if v := recover(); v != nil {
+				slog.Default().Error("cache: background refresh panicked", "key", key, "panic", v)
+			}
+		}()
 		defer func() {
 			c.mu.Lock()
 			delete(c.refreshing, key)
@@ -204,6 +218,11 @@ func storableHeaders(h http.Header) http.Header {
 }
 
 func (c *Cache) shouldCache(path string) bool {
+	// Vite emits hashed, immutable bundles under /assets/; caching them in
+	// Redis buys nothing over the embedded filesystem.
+	if strings.HasPrefix(path, "/assets/") {
+		return false
+	}
 	for _, p := range c.cfg.NoCachePaths {
 		if path == p {
 			return false
@@ -237,15 +256,23 @@ func cacheKey(r *http.Request) string {
 	return keyPrefix + r.Method + ":" + r.URL.Path
 }
 
+// maxCacheBody caps the size of a response body buffered for caching (and for
+// background revalidation). Larger responses still stream straight to the
+// client but are not stored, so a huge or misbehaving upstream can't balloon
+// memory on every cache miss or stale request under many concurrent users.
+const maxCacheBody = 8 << 20
+
 // captureResponse buffers the handler output so it can be cached or refreshed.
 // For the normal request path Header() returns the live writer's map so handler
 // headers reach the client; the refresh path (no ResponseWriter) uses an
-// explicit snapshot instead.
+// explicit snapshot instead. Bodies beyond maxCacheBody are passed through
+// untouched and marked overflow so callers skip caching.
 type captureResponse struct {
 	http.ResponseWriter
-	buf     *bytes.Buffer
-	code    int
-	Headers http.Header
+	buf      *bytes.Buffer
+	code     int
+	Headers  http.Header
+	overflow bool
 }
 
 func (cr *captureResponse) Header() http.Header {
@@ -266,7 +293,14 @@ func (cr *captureResponse) WriteHeader(code int) {
 }
 
 func (cr *captureResponse) Write(b []byte) (int, error) {
-	cr.buf.Write(b)
+	if !cr.overflow {
+		if cr.buf.Len()+len(b) > maxCacheBody {
+			cr.overflow = true
+			cr.buf.Reset()
+		} else {
+			cr.buf.Write(b)
+		}
+	}
 	if cr.ResponseWriter != nil {
 		return cr.ResponseWriter.Write(b)
 	}

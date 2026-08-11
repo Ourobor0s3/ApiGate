@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"compress/gzip"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -30,6 +31,37 @@ func TestNewSkipsEmptyRoutes(t *testing.T) {
 func TestNewRejectsInvalidURL(t *testing.T) {
 	if _, err := New(Config{WeatherAPI: "://bad"}); err == nil {
 		t.Error("New() with invalid URL: expected error, got nil")
+	}
+}
+
+// TestUpstreamGzipIsDecoded guards the raw-body contract: an upstream that
+// ignores the Accept-Encoding: identity request and compresses anyway must not
+// leak compressed bytes (labeled as nothing) into the cache or to clients.
+func TestUpstreamGzipIsDecoded(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		gz.Write([]byte(`{"ok":true}`))
+		gz.Close()
+	}))
+	defer upstream.Close()
+
+	p, err := New(Config{WeatherAPI: upstream.URL})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	p.Weather().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/weather", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != `{"ok":true}` {
+		t.Errorf("body = %q, want decompressed %q", got, `{"ok":true}`)
+	}
+	if enc := rec.Header().Get("Content-Encoding"); enc != "" {
+		t.Errorf("Content-Encoding = %q, want empty (decoded upstream)", enc)
 	}
 }
 

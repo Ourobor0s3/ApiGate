@@ -31,6 +31,19 @@ go.work.sum
 dump.rdb
 appendonlydir/
 
+# Go build output left at the repo root (`go build ./cmd/apigate`)
+/apigate
+/apigate.exe
+
+# frontend build deps and output (frontend/dist is served at runtime;
+# run `npm run build` before `go run`)
+frontend/node_modules/
+frontend/dist/
+
+# logs
+*.log
+npm-debug.log*
+
 # local-only dev/release scripts
 scripts/
 

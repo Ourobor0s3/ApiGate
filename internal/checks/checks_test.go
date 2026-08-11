@@ -147,28 +147,6 @@ func TestIsWrongType(t *testing.T) {
 	}
 }
 
-func TestBlockedIP(t *testing.T) {
-	cases := map[string]bool{
-		"127.0.0.1":       true,  // loopback
-		"::1":             true,  // loopback v6
-		"10.0.0.5":        true,  // private
-		"192.168.1.1":     true,  // private
-		"172.16.0.1":      true,  // private
-		"169.254.169.254": true,  // link-local (cloud metadata)
-		"0.0.0.0":         true,  // unspecified
-		"8.8.8.8":         false, // public
-		"1.1.1.1":         false, // public
-	}
-	for ip, want := range cases {
-		if got := blockedIP(net.ParseIP(ip)); got != want {
-			t.Errorf("blockedIP(%s) = %v, want %v", ip, got, want)
-		}
-	}
-}
-
-// TestGuardedDialRefusesLoopback guards the SSRF redirect hole: even if an
-// Add-time DNS check passes, the dial-time guard must refuse a connection to a
-// private/loopback address.
 func TestGuardedDialRefusesLoopback(t *testing.T) {
 	base := &net.Dialer{Timeout: time.Second}
 	dial := guardedDialContext(base)

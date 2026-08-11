@@ -146,25 +146,49 @@ end
 return added
 `)
 
+// maxArticleBytes caps a single stored article's encoded size. Real newsapi
+// entries are a few KB at most; skipping an outlier keeps one oversized
+// response from bloating Redis for the article's whole TTL.
+const maxArticleBytes = 64 << 10
+
+// storedArticle couples an article ready for persistence with its dedup
+// identity and JSON blob.
+type storedArticle struct {
+	id      string
+	blob    []byte
+	article Article
+}
+
+// storableArticles selects the articles worth persisting: it drops entries
+// without a URL (no dedup identity) and any that encode beyond maxArticleBytes.
+func storableArticles(articles []Article) []storedArticle {
+	out := make([]storedArticle, 0, len(articles))
+	for _, a := range articles {
+		if a.URL == "" {
+			continue
+		}
+		b, err := json.Marshal(a)
+		if err != nil || len(b) > maxArticleBytes {
+			continue
+		}
+		out = append(out, storedArticle{id: articleID(a.URL), blob: b, article: a})
+	}
+	return out
+}
+
 // Store adds articles without overwriting existing ones. A key already present
 // keeps its value and original TTL (SET NX); the index dedups on the URL
 // digest member, so the same article never appears twice regardless of how many
 // fetches return it.
 func (s *Store) Store(ctx context.Context, articles []Article) error {
 	s.dropLegacy(ctx)
-	args := []interface{}{s.articlePrefix()}
-	for _, a := range articles {
-		if a.URL == "" {
-			continue
-		}
-		b, err := json.Marshal(a)
-		if err != nil {
-			continue
-		}
-		args = append(args, articleID(a.URL), b, publishedScore(a))
-	}
-	if len(args) == 1 {
+	stored := storableArticles(articles)
+	if len(stored) == 0 {
 		return nil
+	}
+	args := []interface{}{s.articlePrefix()}
+	for _, a := range stored {
+		args = append(args, a.id, a.blob, publishedScore(a.article))
 	}
 	args = append(args, int64(ArticleTTL/time.Second), int64(indexTTL/time.Second))
 	_, err := storeScript.Run(ctx, s.rdb, []string{s.indexKey()}, args...).Result()

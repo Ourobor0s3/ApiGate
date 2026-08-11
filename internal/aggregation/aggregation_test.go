@@ -23,6 +23,13 @@ func TestParseLocation(t *testing.T) {
 		"10.5,20.25":     {10.5, 20.25},
 		" 10.5 , 20.25 ": {10.5, 20.25},
 		"10.5,bad":       {10.5, 37.6173},
+		// NaN, Inf and out-of-range coordinates are never sent upstream: an
+		// invalid part falls back to the default, and a mix that lands outside
+		// real-world ranges falls back entirely.
+		"NaN,10":  {55.7558, 10},
+		"10,+Inf": {10, 37.6173},
+		"90.5,10": {55.7558, 37.6173},
+		"10,181":  {55.7558, 37.6173},
 	}
 	for in, want := range cases {
 		lat, lon := parseLocation(in)
@@ -32,18 +39,46 @@ func TestParseLocation(t *testing.T) {
 	}
 }
 
-func TestIsKeyError(t *testing.T) {
-	if !isKeyError(map[string]interface{}{"status": "error", "code": "apiKeyMissing"}) {
-		t.Error("apiKeyMissing not detected")
+func TestParseCurrency(t *testing.T) {
+	cases := map[string]struct {
+		wantCode   string
+		wantAmount float64
+	}{
+		"":         {"", 1},
+		"EUR":      {"EUR", 1},
+		" rub ":    {"RUB", 1},
+		"100RUB":   {"RUB", 100},
+		"100 RUB":  {"RUB", 100},
+		"12.5 EUR": {"EUR", 12.5},
+		"0":        {"0", 1},
+		"garbage":  {"GARBAGE", 1},
+		"RUB 100":  {"RUB 100", 1},
 	}
-	if isKeyError(map[string]interface{}{"status": "error", "code": "other"}) {
-		t.Error("unrelated error code detected as key error")
+	for in, want := range cases {
+		code, amount := parseCurrency(in)
+		if code != want.wantCode || amount != want.wantAmount {
+			t.Errorf("parseCurrency(%q) = (%q, %v), want (%q, %v)", in, code, amount, want.wantCode, want.wantAmount)
+		}
 	}
-	if isKeyError(map[string]interface{}{"status": "ok"}) {
-		t.Error("ok status detected as key error")
+}
+
+func TestServeHTTPRatesScaled(t *testing.T) {
+	h := testDashboard(t, withSecret("MAIN_CURRENCY", "100RUB"))
+	h.pollSnapshot(context.Background())
+	data := decodeDash(t, h)
+
+	m, ok := data.Rates.(map[string]interface{})
+	if !ok {
+		t.Fatalf("Rates = %#v, want map", data.Rates)
 	}
-	if isKeyError("not a map") {
-		t.Error("non-map detected as key error")
+	if m["base"] != "USD" {
+		t.Errorf("base = %v, want USD", m["base"])
+	}
+	if got, ok := m["amount"].(float64); !ok || got != 100 {
+		t.Errorf("amount = %v, want 100", m["amount"])
+	}
+	if got, ok := m["rates"].(map[string]interface{})["EUR"].(float64); !ok || got != 90 {
+		t.Errorf("EUR rate = %v, want 90", m["rates"].(map[string]interface{})["EUR"])
 	}
 }
 
@@ -74,8 +109,18 @@ func TestFilterRecentArticles(t *testing.T) {
 
 func TestServeHTTP(t *testing.T) {
 	weather := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("current_weather") != "true" {
+		q := r.URL.Query()
+		if q.Get("current_weather") != "true" {
 			t.Errorf("weather request missing current_weather param")
+		}
+		if q.Get("hourly") != "temperature_2m,weathercode,precipitation_probability" {
+			t.Errorf("weather request missing hourly vars, got %q", q.Get("hourly"))
+		}
+		if q.Get("daily") != "sunrise,sunset" {
+			t.Errorf("weather request missing daily vars, got %q", q.Get("daily"))
+		}
+		if q.Get("forecast_days") != "2" {
+			t.Errorf("weather request must cover two days, got %q", q.Get("forecast_days"))
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"latitude": 10.0,
@@ -126,9 +171,11 @@ func TestServeHTTP(t *testing.T) {
 		WithPlaceURL(place.URL),
 		WithNewsURL(news.URL),
 		WithRatesURL(rates.URL),
+		WithKV(newMemKV()),
 	)
 
 	h.pollNews(context.Background())
+	h.pollSnapshot(context.Background())
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
@@ -174,6 +221,7 @@ func TestServeHTTPNewsQuotaExhausted(t *testing.T) {
 
 	h := testDashboard(t, WithNewsURL(news.URL), WithNewsQuota(denyQuota{}))
 	h.pollNews(context.Background())
+	h.pollSnapshot(context.Background())
 
 	data := decodeDash(t, h)
 	m, ok := data.News.(map[string]interface{})
@@ -223,6 +271,7 @@ func TestServeHTTPNewsUpstreamError(t *testing.T) {
 
 	h := testDashboard(t, WithNewsURL(news.URL))
 	h.pollNews(context.Background())
+	h.pollSnapshot(context.Background())
 
 	data := decodeDash(t, h)
 	m, ok := data.News.(map[string]interface{})
@@ -388,6 +437,194 @@ func TestServeHTTPAllFailures(t *testing.T) {
 	m, ok := data.News.(map[string]interface{})
 	if !ok || m["status"] != "error" || m["code"] != "upstreamError" {
 		t.Errorf("News = %v, want upstreamError error object", data.News)
+	}
+}
+
+func TestPollNewsSecretURLBlockedWhenPrivate(t *testing.T) {
+	privateHit := false
+	private := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		privateHit = true
+	}))
+	defer private.Close()
+
+	safeHit := false
+	safe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		safeHit = true
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "articles": []interface{}{}})
+	}))
+	defer safe.Close()
+
+	// "NEWS_API_URL" points at a loopback endpoint via the secrets layer — an
+	// operator could turn the poller into an SSRF probe that way; the guard
+	// must reject the private upstream and fall back to the compiled default.
+	h := New(
+		func(ctx context.Context, name string) string {
+			if name == "NEWS_API_URL" {
+				return private.URL
+			}
+			return ""
+		},
+		WithNewsURL(safe.URL),
+		WithNewsStore(newMemStore()),
+	)
+	h.pollNews(context.Background())
+
+	if privateHit {
+		t.Error("private (loopback) news upstream was contacted — SSRF guard failed")
+	}
+	if !safeHit {
+		t.Error("fallback news upstream not used after the private URL was rejected")
+	}
+}
+
+// TestServeHTTPNeverHitsUpstreams proves /dashboard is served purely from the
+// Redis-backed stores: after one poll, repeated requests must not contact the
+// weather/place/rates/news upstreams at all.
+func TestServeHTTPNeverHitsUpstreams(t *testing.T) {
+	var mu sync.Mutex
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "ok",
+			"articles": []interface{}{
+				newsArticle("Fresh", "https://x.com/fresh", recentPublished(1)),
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	h := New(
+		func(ctx context.Context, name string) string { return "" },
+		WithHTTPClient(upstream.Client()),
+		WithWeatherURL(upstream.URL),
+		WithPlaceURL(upstream.URL),
+		WithRatesURL(upstream.URL),
+		WithNewsURL(upstream.URL),
+		WithNewsStore(newMemStore()),
+		WithNewsStoreRU(newMemStore()),
+		WithKV(newMemKV()),
+	)
+
+	// One full poll cycle warms news + weather + place + rates in the stores.
+	h.pollAll(context.Background())
+
+	mu.Lock()
+	before := hits
+	mu.Unlock()
+	if before == 0 {
+		t.Fatal("first poll did not hit the upstreams")
+	}
+
+	for i := 0; i < 5; i++ {
+		decodeDash(t, h)
+	}
+	mu.Lock()
+	after := hits
+	mu.Unlock()
+	if after != before {
+		t.Errorf("dashboard requests hit upstreams: hits %d -> %d, want unchanged", before, after)
+	}
+}
+
+func TestServeHTTPRatesWithoutCurrency(t *testing.T) {
+	// With no MAIN_CURRENCY configured the poller stores the snapshot under
+	// the USD key; the dashboard must compute the same key, or the rates card
+	// would stay empty on the default config.
+	h := testDashboard(t)
+	h.pollSnapshot(context.Background())
+	data := decodeDash(t, h)
+
+	m, ok := data.Rates.(map[string]interface{})
+	if !ok {
+		t.Fatalf("Rates = %#v, want map", data.Rates)
+	}
+	if m["base"] != "USD" {
+		t.Errorf("base = %v, want USD", m["base"])
+	}
+	if _, ok := m["rates"].(map[string]interface{}); !ok {
+		t.Errorf("rates = %v, want map", m["rates"])
+	}
+}
+
+// TestPollNowRefreshesSnapshots checks that PollNow kicks off a full
+// out-of-cycle refresh (weather + place + rates snapshots and the news poll)
+// instead of waiting for the next scheduled cycle.
+func TestPollNowRefreshesSnapshots(t *testing.T) {
+	var mu sync.Mutex
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+	}))
+	defer upstream.Close()
+
+	h := New(
+		func(context.Context, string) string { return "" },
+		WithHTTPClient(upstream.Client()),
+		WithWeatherURL(upstream.URL),
+		WithPlaceURL(upstream.URL),
+		WithRatesURL(upstream.URL),
+		WithNewsURL(upstream.URL),
+		WithNewsURLRU(upstream.URL),
+		WithNewsStore(newMemStore()),
+		WithNewsStoreRU(newMemStore()),
+		WithKV(newMemKV()),
+	)
+
+	h.PollNow()
+
+	// pollAll = news EN + place + weather + rates (RU store also configured;
+	// RU poll fires its own request). Wait for the fetches to land.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := hits
+		mu.Unlock()
+		if n >= 5 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	mu.Lock()
+	n := hits
+	mu.Unlock()
+	t.Fatalf("PollNow did not trigger a full refresh within 5s: hits = %d, want >= 5", n)
+}
+
+func TestPollNewsRedirectToPrivateBlocked(t *testing.T) {
+	privateHit := false
+	inner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		privateHit = true
+	}))
+	defer inner.Close()
+
+	// A public-looking upstream that redirects into the private network: the
+	// pre-fetch host check passes for the outer URL, so only the redirect
+	// guard can stop the fetch from reaching the inner server.
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, inner.URL, http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	h := New(
+		func(ctx context.Context, name string) string { return "" },
+		WithNewsURL(redirector.URL),
+		WithNewsStore(newMemStore()),
+	)
+	h.pollNews(context.Background())
+
+	if privateHit {
+		t.Error("redirect reached a private address — SSRF redirect guard failed")
+	}
+	data := decodeDash(t, h)
+	m, ok := data.News.(map[string]interface{})
+	if !ok || m["status"] != "error" || m["code"] != "upstreamError" {
+		t.Errorf("News = %v, want upstreamError object after the blocked redirect", data.News)
 	}
 }
 
@@ -641,9 +878,73 @@ func TestRunPollsImmediately(t *testing.T) {
 	}
 }
 
+func TestRunPollsBothLanguages(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[string]int{}
+	upstream := func(name string) *httptest.Server {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			hits[name]++
+			mu.Unlock()
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "articles": []interface{}{}})
+		}))
+		t.Cleanup(s.Close)
+		return s
+	}
+	en := upstream("en")
+	ru := upstream("ru")
+
+	h := testDashboard(t,
+		WithNewsURL(en.URL),
+		WithNewsStore(newMemStore()),
+		WithNewsURLRU(ru.URL),
+		WithNewsStoreRU(newMemStore()),
+		WithNewsPollInterval(func(context.Context) time.Duration { return time.Hour }),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		h.Run(ctx)
+		close(done)
+	}()
+	defer func() { cancel(); <-done }()
+
+	deadline := time.After(5 * time.Second)
+	for {
+		mu.Lock()
+		got := len(hits)
+		mu.Unlock()
+		if got == 2 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("first poll did not hit both upstreams, hits: %v", hits)
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+// withSecret returns an Option that wraps the handler's secret getter so the
+// named secret reports value, letting a test override a single secret while
+// keeping the wired getter.
+func withSecret(name, value string) Option {
+	return func(h *Handler) {
+		prev := h.getSecret
+		h.getSecret = func(ctx context.Context, n string) string {
+			if n == name {
+				return value
+			}
+			return prev(ctx, n)
+		}
+	}
+}
+
 // testDashboard builds a Handler backed by throwaway httptest servers for the
-// weather/place/rates upstreams, plus any extra options. The news upstream is
-// provided by the caller via WithNewsURL.
+// weather/place/rates upstreams and an in-memory snapshot store, plus any
+// extra options. The news upstream is provided by the caller via WithNewsURL.
 func testDashboard(t *testing.T, opts ...Option) *Handler {
 	t.Helper()
 	upstream := func(body string) *httptest.Server {
@@ -663,8 +964,33 @@ func testDashboard(t *testing.T, opts ...Option) *Handler {
 			WithWeatherURL(weather.URL),
 			WithPlaceURL(place.URL),
 			WithRatesURL(rates.URL),
+			WithKV(newMemKV()),
 		}, opts...)...,
 	)
+}
+
+// memKV is an in-memory Store for the dashboard snapshots, keyed like the
+// Redis-backed store without expiry semantics (snapshotTTL is not enforced).
+type memKV struct {
+	mu     sync.Mutex
+	values map[string]string
+}
+
+func newMemKV() *memKV {
+	return &memKV{values: map[string]string{}}
+}
+
+func (m *memKV) Get(_ context.Context, key string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.values[key], nil
+}
+
+func (m *memKV) Set(_ context.Context, key, value string, _ time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.values[key] = value
+	return nil
 }
 
 // decodeDash serves one dashboard request and returns the decoded payload.
