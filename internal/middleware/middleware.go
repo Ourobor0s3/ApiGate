@@ -17,8 +17,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// ClientIP returns the client's IP from RemoteAddr. The X-Forwarded-For header
-// is deliberately ignored: it is client-controlled and trivially spoofable, and
+// ClientIP returns the client's IP from RemoteAddr. X-Forwarded-For is
+// deliberately ignored: it is client-controlled and trivially spoofable, and
 // trusting it would let anyone bypass per-IP rate limits or make their requests
 // counted against a different client. Behind a trusted reverse proxy, use
 // ForwardedClientIP instead.
@@ -73,8 +73,8 @@ func isTrustedPeer(remoteAddr string, blocks []*net.IPNet) bool {
 	return false
 }
 
-// StatusRecorder wraps a ResponseWriter to capture the response status code and
-// body size for logging.
+// StatusRecorder wraps a ResponseWriter to capture the status code and body
+// size for logging.
 type StatusRecorder struct {
 	http.ResponseWriter
 	Status int
@@ -110,8 +110,8 @@ func (r *StatusRecorder) Unwrap() http.ResponseWriter {
 // RequestLogger logs every request with method, path, status, size, latency
 // and client IP. The query string is deliberately not logged — it may carry
 // API keys. clientIP lets the caller pass the same trusted-proxy-aware
-// resolver the rate limiter uses so the logged IP always matches the one the
-// limits are applied against; pass ClientIP for the plain RemoteAddr default.
+// resolver the rate limiter uses, so the logged IP always matches the one the
+// limits are applied against.
 func RequestLogger(logger *slog.Logger, clientIP func(*http.Request) string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -241,7 +241,7 @@ type gzipResponseWriter struct {
 	status   int
 }
 
-// shouldCompress reports whether a response of the given status and the header
+// shouldCompress reports whether a response of the given status and
 // Content-Type is worth gzip-encoding.
 func (g *gzipResponseWriter) shouldCompress(code int) bool {
 	if code < 200 || code >= 400 {

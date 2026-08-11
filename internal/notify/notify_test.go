@@ -47,21 +47,27 @@ func TestPostSendsJSON(t *testing.T) {
 }
 
 func TestDisabledClientIsNoop(t *testing.T) {
-	// A client built from an empty URL must not attempt any request.
-	called := false
 	c := New("")
-	c.Post(context.Background(), map[string]any{"event": "x"})
-	if called {
-		t.Fatal("disabled client made a request")
+	if c.Enabled() {
+		t.Fatal("client built without a URL must report disabled")
 	}
+	c.Post(context.Background(), map[string]any{"event": "x"})
 }
 
-func TestPostLogsNon2xx(t *testing.T) {
+func TestPostNon2xxIsTolerated(t *testing.T) {
+	received := make(chan struct{}, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- struct{}{}
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 
 	c := New(srv.URL)
 	c.Post(context.Background(), map[string]any{"event": "x"})
+
+	select {
+	case <-received:
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook request never arrived")
+	}
 }

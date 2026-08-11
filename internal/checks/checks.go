@@ -1,9 +1,7 @@
 // Package checks probes user-configured URLs on a schedule and stores the
-// latest result, so the dashboard can show each site's reachability status.
-// Targets live in Redis, so they survive restarts; the polling interval comes
+// latest result for the dashboard. Targets live in Redis, the interval comes
 // from a per-request resolver (typically a secret), defaulting to 5 minutes.
-// Probe history lives in one ZSET per target, score-pruned on every write and
-// read, so records older than two days are removed automatically.
+// Probe history lives in one ZSET per target, pruned on every write/read.
 package checks
 
 import (
@@ -38,25 +36,24 @@ var (
 )
 
 // historyLimit caps how many probe results are kept per target for uptime
-// reporting. Older entries are trimmed away on each probe. The latest probe
-// result is always the last entry of the history ZSET, so no separate status
-// key is kept.
+// reporting; older entries are trimmed on each probe. The latest probe result
+// is always the last entry of the history ZSET, so no separate status key is
+// kept.
 const historyLimit = 100
 
-// historyWindow is how long a probe record stays in the history. Entries
-// older than this are pruned by score on every write and read, so records of
-// two days ago are deleted automatically without a background sweeper.
+// historyWindow is how long a probe record stays in the history; older
+// entries are pruned by score on every write/read, no background sweeper.
 const historyWindow = 48 * time.Hour
 
 // checkDrainBytes is how much of a probe response body is read before the
-// connection is closed. Draining a small slice lets the transport reuse the
-// keep-alive connection; anything larger is cut off so a huge body can't be
-// transferred in full on every probe.
+// connection is closed, so keep-alive connections stay reusable without
+// transferring a huge body in full on every probe.
 const checkDrainBytes = 64 << 10
 
 // targetsKey is a Redis SET of the URLs to probe.
 const targetsKey = "check:targets"
 
+// Config configures a Checks instance.
 type Config struct {
 	HTTPClient *http.Client
 	Logger     *slog.Logger
@@ -110,11 +107,10 @@ func New(rdb *redis.Client, cfg Config) *Checks {
 	return &Checks{rdb: rdb, httpClient: cfg.HTTPClient, logger: cfg.Logger, interval: cfg.Interval, onChange: cfg.OnStatusChange, allowPrivate: cfg.AllowPrivate}
 }
 
-// newCheckClient builds the probing client. Unless private addresses are
-// explicitly allowed, every connection — including any redirect the probe
-// follows — is validated against loopback/private/link-local ranges at dial
-// time, so an Add-time DNS check alone can't be bypassed by redirecting a
-// public URL to an internal address.
+// newCheckClient builds the probing client. Unless AllowPrivate is set, every
+// connection — including any redirect the probe follows — is validated against
+// private ranges at dial time, so an Add-time DNS check alone can't be
+// bypassed by redirecting a public URL to an internal address.
 func newCheckClient(allowPrivate bool) *http.Client {
 	base := &net.Dialer{Timeout: 5 * time.Second}
 	transport := &http.Transport{
@@ -132,23 +128,16 @@ func newCheckClient(allowPrivate bool) *http.Client {
 	return &http.Client{Timeout: 8 * time.Second, Transport: transport}
 }
 
-// guardedDialContext returns a DialContext that refuses connections to
-// loopback/private/link-local addresses. Names that fail to resolve are passed
-// through — the probe itself surfaces the failure.
+// guardedDialContext wraps the shared netguard dial guard, mapping its error
+// to the API-facing ErrPrivateAddress so the REST handler classifies it.
 func guardedDialContext(base *net.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	dial := netguard.RestrictedDialContext(base)
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, _, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, err
+		conn, err := dial(ctx, network, addr)
+		if errors.Is(err, netguard.ErrBlocked) {
+			return nil, ErrPrivateAddress
 		}
-		if ips, err := net.LookupIP(host); err == nil {
-			for _, ip := range ips {
-				if netguard.BlockedIP(ip) {
-					return nil, ErrPrivateAddress
-				}
-			}
-		}
-		return base.DialContext(ctx, network, addr)
+		return conn, err
 	}
 }
 
@@ -157,21 +146,18 @@ func guardedDialContext(base *net.Dialer) func(ctx context.Context, network, add
 const historyKeyPrefix = "check:history:"
 
 // historyTTL bounds how long a history key survives after its last probe, so a
-// target that stops being polled cleans itself up instead of keeping its final
-// record forever. Refreshed on every write, it comfortably exceeds
-// historyWindow + the longest polling interval.
+// target that stops being polled cleans itself up. Refreshed on every write,
+// it comfortably exceeds historyWindow + the longest polling interval.
 const historyTTL = 4 * 24 * time.Hour
 
 // historyKey is the per-target ZSET of probe records: each member is a Status
 // JSON blob scored by probe time (ascending, so rank order is oldest→newest).
 // The key embeds a digest of the target URL, not the URL itself, so the
-// keyspace stays uniform (check:history:<hex>) no matter how the URL is
-// spelled — http:// vs https://, trailing slashes, query strings.
+// keyspace stays uniform regardless of URL spelling.
 func historyKey(rawurl string) string { return historyKeyPrefix + sha1hex(rawurl) }
 
 // legacyHistoryKey is the pre-digest key ("check:history:<url>") written by
-// earlier versions. It is dropped on sight so it can't accumulate; the target
-// URL is always available from the check:targets SET.
+// earlier versions. It is dropped on sight so it can't accumulate.
 func legacyHistoryKey(rawurl string) string { return historyKeyPrefix + rawurl }
 
 // sha1hex digests a string into the 40-hex-char form used in history keys.
@@ -227,9 +213,6 @@ func guardPublicAddress(ctx context.Context, rawurl string) error {
 }
 
 // List returns all targets (sorted by display name) and the current interval.
-// Each target's history is read in one call and pruned of records older than
-// historyWindow as a side effect; the latest probe result doubles as the
-// current status.
 func (c *Checks) List(ctx context.Context) ([]Item, time.Duration, error) {
 	urls, err := c.rdb.SMembers(ctx, targetsKey).Result()
 	if err != nil {
@@ -249,36 +232,29 @@ func (c *Checks) List(ctx context.Context) ([]Item, time.Duration, error) {
 	return items, c.interval(ctx), nil
 }
 
-// historyEntries returns a target's probe records (Status JSON blobs) in
-// chronological order, pruning records older than historyWindow as a side
-// effect so the two-day window holds even when probes are sparse. The returned
-// list reflects the pruned state (the uptime/status below is computed from the
-// records that are actually kept). A legacy list key from before the ZSET
-// format is dropped on sight, and so is the legacy URL-keyed history key from
-// before the digest format — both migrate on first read.
+// historyEntries returns a target's probe records in chronological order,
+// pruning records older than historyWindow as a side effect so the two-day
+// window holds even when probes are sparse. Legacy keys are dropped on sight
+// — both formats migrate on first read.
 func (c *Checks) historyEntries(ctx context.Context, rawurl string) []string {
-	c.rdb.Del(ctx, legacyHistoryKey(rawurl))
-	members, err := c.rdb.ZRange(ctx, historyKey(rawurl), 0, -1).Result()
-	if err != nil {
+	key := historyKey(rawurl)
+	pipe := c.rdb.Pipeline()
+	pipe.Del(ctx, legacyHistoryKey(rawurl))
+	cutoff := strconv.FormatInt(time.Now().Add(-historyWindow).UnixMilli(), 10)
+	pipe.ZRemRangeByScore(ctx, key, "0", cutoff)
+	pruned := pipe.ZRange(ctx, key, 0, -1)
+	if _, err := pipe.Exec(ctx); err != nil {
+		c.logger.Warn("checks: cannot read history", "url", rawurl, "err", err)
 		if isWrongType(err) {
-			c.rdb.Del(ctx, historyKey(rawurl))
+			c.rdb.Del(ctx, key)
 		}
 		return nil
 	}
-	if len(members) == 0 {
+	members, err := pruned.Result()
+	if err != nil {
 		return nil
 	}
-	cutoff := time.Now().Add(-historyWindow).UnixMilli()
-	if err := c.rdb.ZRemRangeByScore(ctx, historyKey(rawurl), "0", strconv.FormatInt(cutoff, 10)).Err(); err != nil {
-		c.logger.Warn("checks: cannot prune history", "url", rawurl, "err", err)
-		return members
-	}
-	// Re-read after pruning so the returned entries are exactly what is kept.
-	pruned, err := c.rdb.ZRange(ctx, historyKey(rawurl), 0, -1).Result()
-	if err != nil {
-		return members
-	}
-	return pruned
+	return members
 }
 
 // lastStatus parses the latest probe result (the last history entry) into a
@@ -333,15 +309,14 @@ func (c *Checks) Run(ctx context.Context) {
 }
 
 // CheckAll probes every target immediately and returns the fresh results, used
-// by the "check now" button so the UI can show an up-to-date status right away.
+// by the "check now" button.
 func (c *Checks) CheckAll(ctx context.Context) ([]Item, time.Duration, error) {
 	c.checkAll(ctx)
 	return c.List(ctx)
 }
 
 // probeWorkers caps how many target probes run at once, so a large target list
-// can't open an unbounded number of connections against both the targets and
-// Redis on every cycle.
+// can't open an unbounded number of connections on every cycle.
 const probeWorkers = 10
 
 func (c *Checks) checkAll(ctx context.Context) {
@@ -389,8 +364,7 @@ func (c *Checks) checkOne(ctx context.Context, rawurl string) {
 	if err != nil {
 		c.logger.Warn("checks: request failed", "url", rawurl, "err", err)
 	} else {
-		// Drain a bounded slice so the keep-alive connection is reusable for
-		// the next probe instead of being discarded unused.
+		// Drain a bounded slice so the keep-alive connection is reusable.
 		_, _ = io.CopyN(io.Discard, resp.Body, checkDrainBytes)
 		resp.Body.Close()
 		s.OK = resp.StatusCode >= 200 && resp.StatusCode < 400
@@ -402,15 +376,14 @@ func (c *Checks) checkOne(ctx context.Context, rawurl string) {
 	if err != nil {
 		return
 	}
-	// One timestamp for the record and its history score: the ZSET orders by
-	// score, so the two must never disagree (e.g. across a midnight boundary).
+	// One timestamp for the record and its history score: the two must never
+	// disagree (e.g. across a midnight boundary).
 	if !c.storeStatus(ctx, rawurl, b, at) {
 		return
 	}
 
-	// Fire the status-change hook only when there was a prior recorded result
-	// and the healthy/failing state actually flipped, so it doesn't spam on
-	// every probe of an unchanged target.
+	// Fire the status-change hook only when a prior result exists and the
+	// healthy/failing state actually flipped.
 	if c.onChange != nil {
 		prev := c.previousStatus(ctx, rawurl)
 		if prev.CheckedAt != "" && prev.OK != s.OK {
@@ -450,8 +423,7 @@ func (c *Checks) storeStatus(ctx context.Context, rawurl string, record []byte, 
 }
 
 // previousStatus returns the status recorded before the just-stored one (the
-// second-to-last entry of the history ZSET), or an empty Status when there
-// was no prior result.
+// second-to-last entry of the history ZSET).
 func (c *Checks) previousStatus(ctx context.Context, rawurl string) Status {
 	members, err := c.rdb.ZRange(ctx, historyKey(rawurl), -2, -2).Result()
 	if err != nil || len(members) == 0 {
@@ -464,8 +436,7 @@ func (c *Checks) previousStatus(ctx context.Context, rawurl string) Status {
 	return Status{}
 }
 
-// uptime computes the percentage of OK probes across the stored history
-// entries (each a Status JSON blob), 0 when there's no parseable history.
+// uptime computes the percentage of OK probes across the stored history.
 func uptime(entries []string) float64 {
 	var ok, total int
 	for _, e := range entries {
@@ -507,19 +478,8 @@ func validateURL(rawurl string) error {
 	return nil
 }
 
-// ParseInterval converts a Go duration string (e.g. "5m", "6m 30s") into an
-// interval, falling back to DefaultInterval on empty or invalid input. Internal
-// whitespace is ignored so "6m 30s" parses the same as "6m30s".
-func ParseInterval(v string) time.Duration {
-	if d, err := time.ParseDuration(strings.Join(strings.Fields(v), "")); err == nil && d > 0 {
-		return d
-	}
-	return DefaultInterval
-}
-
-// Handler exposes the checks store as a small REST API, mirroring the secrets
-// handler: GET lists targets + statuses, POST {url} adds one, DELETE ?url=
-// removes it.
+// Handler exposes the checks store as a small REST API: GET lists targets +
+// statuses, POST {url} adds one, DELETE ?url= removes it.
 type Handler struct {
 	ch *Checks
 }
@@ -546,11 +506,11 @@ func (h *Handler) writeList(w http.ResponseWriter, items []Item, interval time.D
 }
 
 // runAll re-probes every target right now and returns the fresh list, backing
-// the "Check now" button. Checks run concurrently, so latency is bounded by the
-// slowest single probe rather than the sum of all of them.
+// the "Check now" button. Checks run concurrently, so latency is bounded by
+// the slowest single probe.
 func (h *Handler) runAll(w http.ResponseWriter, r *http.Request) {
-	// The request context dies with the client; probing should run to
-	// completion so the store stays fresh, so use a bounded background context.
+	// The request context dies with the client, so use a bounded background
+	// context to let probing run to completion.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	items, interval, err := h.ch.CheckAll(ctx)
@@ -596,8 +556,7 @@ func (h *Handler) add(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Probe it right away so the section shows a status without waiting for
-	// the next interval tick. The request's context dies with the handler, so
-	// use a fresh bounded context.
+	// the next interval tick, on a fresh bounded context.
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

@@ -2,6 +2,7 @@ package netguard
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -50,6 +51,18 @@ func TestPrivateHost(t *testing.T) {
 	for _, c := range cases {
 		if got := PrivateHost(ctx, c.host); got != c.block {
 			t.Errorf("PrivateHost(%q) = %v, want %v", c.host, got, c.block)
+		}
+	}
+}
+
+func TestRestrictedDialContextRefusesBlocked(t *testing.T) {
+	dial := RestrictedDialContext(&net.Dialer{Timeout: time.Second})
+	for _, addr := range []string{"127.0.0.1:80", "169.254.169.254:80", "10.0.0.1:80"} {
+		if conn, err := dial(context.Background(), "tcp", addr); !errors.Is(err, ErrBlocked) {
+			if conn != nil {
+				conn.Close()
+			}
+			t.Errorf("dial %s err = %v, want ErrBlocked", addr, err)
 		}
 	}
 }

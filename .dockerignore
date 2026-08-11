@@ -1,0 +1,17 @@
+.git
+.gitignore
+Dockerfile
+docker-compose.yml
+dump.rdb
+appendonlydir/
+frontend/node_modules/
+frontend/dist/
+scripts/
+.opencode/
+README.md
+AGENTS.md
+docs/
+.env
+.env.*
+*.log
+.DS_Store

@@ -58,6 +58,24 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{values: map[string]string{}}
 }
 
+func TestRedactAPIKeyParam(t *testing.T) {
+	cases := map[string]string{
+		"https://newsapi.org/v2/top-headlines?apiKey=SECRET": "https://newsapi.org/v2/top-headlines",
+		"https://x.org/v2/top?apiKey=SECRET&pageSize=50":     "https://x.org/v2/top?pageSize=50",
+		"https://x.org/v2/top?a=1&apiKey=SECRET&b=2":         "https://x.org/v2/top?a=1&b=2",
+		"https://x.org/v2/top":                               "https://x.org/v2/top",
+		"https://x.org/v2/top?apikey=SECRET":                 "https://x.org/v2/top?apikey=SECRET",
+		"not a url at all":                                   "not a url at all",
+		"55.7558,37.6173":                                    "55.7558,37.6173",
+		"https://x.org/v2/top?apiKey=":                       "https://x.org/v2/top?apiKey=",
+	}
+	for in, want := range cases {
+		if got := redactAPIKeyParam(in); got != want {
+			t.Errorf("redactAPIKeyParam(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // do performs one request (target includes the query string) against the
 // full registered mux.
 func do(h *Handler, method, target, body string) *httptest.ResponseRecorder {

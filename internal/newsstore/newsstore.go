@@ -1,11 +1,9 @@
 // Package newsstore keeps newsapi articles in Redis so the dashboard can show
-// a history of articles instead of only the latest page. Articles are keyed by
-// a SHA-1 digest of their URL and stored once with a 4-day TTL — re-fetched
-// duplicates are skipped, never overwritten. An index ZSET (member = URL digest,
-// score = publishedAt) provides dedup and newest-first ordering. Keys are
-// namespaced per language: "news:index:<lang>" and "news:article:<lang>:<hex>",
-// so the digest keeps the keyspace uniform instead of fragmenting it into
-// "news:article:https:..." / "news:article:http:..." pseudo-directories.
+// history instead of only the latest page. Articles are keyed by a SHA-1
+// digest of their URL, stored once with a 4-day TTL; the index ZSET (member =
+// URL digest, score = publishedAt) provides dedup and newest-first ordering.
+// Keys are namespaced per language: "news:index:<lang>" and
+// "news:article:<lang>:<hex>".
 package newsstore
 
 import (
@@ -36,24 +34,20 @@ type Source struct {
 	Name string `json:"name,omitempty"`
 }
 
-// ArticleTTL is how long a stored article stays alive. Each article keeps its
-// own TTL, measured from when it was first stored, so accumulated history
-// expires gradually rather than all at once. The index outlives every article
-// it points at by one indexTTLMargin day, so a reachable article is never
-// orphaned by its index.
+// ArticleTTL is how long a stored article stays alive, measured from when it
+// was first stored, so accumulated history expires gradually. The index
+// outlives every article it points at by indexTTL, so a reachable article is
+// never orphaned by its index.
 const (
 	ArticleTTL = 4 * 24 * time.Hour
-	// indexTTL extends the index ZSET one day past the newest article it
-	// references, so an article is never orphaned by an index that died first.
-	indexTTL = ArticleTTL + 24*time.Hour
+	indexTTL   = ArticleTTL + 24*time.Hour
 )
 
 const (
 	articlePrefix = "news:article:"
 	indexPrefix   = "news:index:"
-	// legacyIndex is the bare, language-less index key written by versions
-	// before the language namespaces; it is dropped on sight so it can't
-	// accumulate. Its URL-keyed articles expire on their own TTL.
+	// legacyIndex is the bare, language-less index key written by earlier
+	// versions; it is dropped on sight so it can't accumulate.
 	legacyIndex = "news:index"
 )
 
@@ -69,10 +63,8 @@ func New(rdb *redis.Client) *Store {
 }
 
 // NewLang builds a store scoped to a language namespace, news:index:<lang> /
-// news:article:<lang>:<digest>, so English and Russian headlines never share an
-// index or dedup against each other (the dashboard serves news in each UI
-// language via /dashboard.newsRu). An empty lang falls back to the English
-// namespace.
+// news:article:<lang>:<digest>, so English and Russian headlines never share
+// an index. An empty lang falls back to the English namespace.
 func NewLang(rdb *redis.Client, lang string) *Store {
 	if lang == "" {
 		lang = "en"
@@ -88,20 +80,17 @@ func (s *Store) articlePrefix() string {
 	return articlePrefix + s.lang + ":"
 }
 
-// articleID is the Redis key fragment identifying an article: a SHA-1 digest of
-// its URL. Digesting produces short, uniform keys (news:article:en:<40 hex>)
-// instead of embedding the raw URL, whose scheme and slashes fragment the
-// keyspace into "news:article:https:..." / "news:article:http:..." entries.
-// The article's real URL still travels inside its JSON, and dedup keeps working
-// because the same URL always yields the same digest.
+// articleID is the Redis key fragment identifying an article: a SHA-1 digest
+// of its URL, producing short, uniform keys (news:article:en:<40 hex>) instead
+// of fragmenting the keyspace by scheme/slashes. Dedup keeps working because
+// the same URL always yields the same digest.
 func articleID(rawurl string) string {
 	return fmt.Sprintf("%x", sha1.Sum([]byte(rawurl)))
 }
 
 // dropLegacy removes the bare "news:index" key written by earlier versions
-// once, on first sight. The language-suffixed index belongs to the English
-// store only; a RU store never writes the legacy key. Deleting a missing key is
-// a no-op, so this is cheap enough to run on every access.
+// once, on first sight; the language-suffixed index belongs to the English
+// store only. Deleting a missing key is a no-op, so this runs on every access.
 func (s *Store) dropLegacy(ctx context.Context) {
 	if s.lang != "en" {
 		return
@@ -119,13 +108,11 @@ func publishedScore(a Article) int64 {
 	return t.Unix()
 }
 
-// storeScript atomically writes a batch of articles in one round trip. For each
-// article the key is only set when new (NX keeps the value and original TTL of
-// an existing key), and the index is touched only for newly stored articles, so
-// overlapping fetches never duplicate or rewrite history. A store that added
-// something also refreshes the index TTL (second-to-last ARGV) plus the margin
-// (last ARGV), so the index self-clears soon after the last addition while
-// outliving its newest article by indexTTL.
+// storeScript atomically writes a batch of articles in one round trip. A key
+// is only set when new (NX keeps the value and original TTL of an existing
+// key), and the index is touched only for newly stored articles, so overlapping
+// fetches never duplicate or rewrite history. A store that added something
+// also refreshes the index TTL by ttl + one-day margin.
 var storeScript = redis.NewScript(`
 local index = KEYS[1]
 local prefix = ARGV[1]
@@ -146,8 +133,8 @@ end
 return added
 `)
 
-// maxArticleBytes caps a single stored article's encoded size. Real newsapi
-// entries are a few KB at most; skipping an outlier keeps one oversized
+// maxArticleBytes caps a single stored article's encoded size; real newsapi
+// entries are a few KB at most. Skipping an outlier keeps one oversized
 // response from bloating Redis for the article's whole TTL.
 const maxArticleBytes = 64 << 10
 
@@ -178,8 +165,7 @@ func storableArticles(articles []Article) []storedArticle {
 
 // Store adds articles without overwriting existing ones. A key already present
 // keeps its value and original TTL (SET NX); the index dedups on the URL
-// digest member, so the same article never appears twice regardless of how many
-// fetches return it.
+// digest member, so the same article never appears twice.
 func (s *Store) Store(ctx context.Context, articles []Article) error {
 	s.dropLegacy(ctx)
 	stored := storableArticles(articles)
@@ -190,7 +176,7 @@ func (s *Store) Store(ctx context.Context, articles []Article) error {
 	for _, a := range stored {
 		args = append(args, a.id, a.blob, publishedScore(a.article))
 	}
-	args = append(args, int64(ArticleTTL/time.Second), int64(indexTTL/time.Second))
+	args = append(args, int64(ArticleTTL/time.Second), int64((indexTTL-ArticleTTL)/time.Second))
 	_, err := storeScript.Run(ctx, s.rdb, []string{s.indexKey()}, args...).Result()
 	return err
 }

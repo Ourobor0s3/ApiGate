@@ -20,8 +20,8 @@ type BreakerConfig struct {
 }
 
 // Breaker guards a single upstream with a closed → open → half-open state
-// machine. It short-circuits requests while the circuit is open and lets one
-// probe through during half-open to decide whether to recover.
+// machine. It short-circuits requests while open and lets one probe through
+// during half-open to decide whether to recover.
 type Breaker struct {
 	mu        sync.Mutex
 	cfg       BreakerConfig

@@ -92,11 +92,11 @@ func newReverseProxy(prefix, target string, params map[string]func(context.Conte
 			req.URL.RawPath = ""
 			req.Host = targetURL.Host
 
-			// The gateway applies compression itself (the Gzip middleware), so
-			// ask the upstream for identity encoding. Otherwise the client's
-			// Accept-Encoding: gzip is forwarded upstream and the compressed
-			// bytes it returns would be cached (and later re-compressed by the
-			// outer gzip) as if they were the raw body.
+			// The gateway applies compression itself (the Gzip middleware), so ask
+			// the upstream for identity encoding. Otherwise the client's
+			// Accept-Encoding: gzip would be forwarded upstream and the
+			// compressed bytes it returns would be cached (and later
+			// re-compressed) as if they were the raw body.
 			req.Header.Set("Accept-Encoding", "identity")
 
 			// Merge query params baked into the target URL (e.g. ?country=us),
@@ -129,9 +129,9 @@ func newReverseProxy(prefix, target string, params map[string]func(context.Conte
 	}, nil
 }
 
-// decodeBody unwraps an upstream response back to its raw representation.
-// The gateway asks for `Accept-Encoding: identity` and caches the returned
-// bytes as-is, so a misbehaving upstream that compresses anyway would have its
+// decodeBody unwraps an upstream response back to its raw representation. The
+// gateway asks for `Accept-Encoding: identity` and caches the returned bytes
+// as-is, so a misbehaving upstream that compresses anyway would have its
 // compressed bytes stored and served to clients as if they were the raw body.
 // Only the declared encoding is removed; unknown or already-decompressed
 // bodies pass through untouched.

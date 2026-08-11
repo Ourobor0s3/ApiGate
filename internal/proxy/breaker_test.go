@@ -8,22 +8,11 @@ import (
 )
 
 func TestBreakerStateMachine(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer upstream.Close()
-
-	flaky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer flaky.Close()
-
 	b := NewBreaker(BreakerConfig{FailureThreshold: 3, Cooldown: 30 * time.Second})
 	if got := b.state(); got != "closed" {
 		t.Fatalf("initial state = %q, want closed", got)
 	}
 
-	// Three failures trip the circuit open.
 	for i := 0; i < 3; i++ {
 		b.failure()
 	}
@@ -34,7 +23,6 @@ func TestBreakerStateMachine(t *testing.T) {
 		t.Fatal("allow() during open must return false")
 	}
 
-	// A success (e.g. after cooldown) closes it again.
 	b.success()
 	if got := b.state(); got != "closed" {
 		t.Fatalf("after success state = %q, want closed", got)

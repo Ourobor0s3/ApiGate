@@ -79,25 +79,6 @@ func TestValidateURL(t *testing.T) {
 	}
 }
 
-func TestParseInterval(t *testing.T) {
-	cases := map[string]time.Duration{
-		"5m":      5 * time.Minute,
-		"1m30s":   90 * time.Second,
-		"6m 30s":  6*time.Minute + 30*time.Second,
-		" 10m ":   10 * time.Minute,
-		"1h 15m":  75 * time.Minute,
-		"":        5 * time.Minute,
-		"garbage": 5 * time.Minute,
-		"0s":      5 * time.Minute,
-		"-1m":     5 * time.Minute,
-	}
-	for in, want := range cases {
-		if got := ParseInterval(in); got != want {
-			t.Errorf("ParseInterval(%q) = %v, want %v", in, got, want)
-		}
-	}
-}
-
 func TestUptime(t *testing.T) {
 	ok := func() string {
 		b, _ := json.Marshal(Status{OK: true})

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -23,37 +24,29 @@ import (
 )
 
 const (
-	// DefaultWeatherURL and DefaultNewsURL are the upstream bases used when
-	// no WEATHER_API_URL / NEWS_API_URL override is set.
 	DefaultWeatherURL = "https://api.open-meteo.com/v1/forecast"
-	// DefaultNewsURL pulls the day's top headlines from a curated list of
-	// major, verified international sources instead of everything matching a
-	// keyword, so the news card shows popular mainstream news. Cap pageSize at
-	// 50 so the poller pulls a bounded payload; articles are persisted in the
-	// news store and replayed across requests.
+	// DefaultNewsURL pulls top headlines from a curated list of major
+	// international sources. pageSize is capped at 50 so the poller pulls a
+	// bounded payload; articles are persisted in the news store and replayed
+	// across requests.
 	DefaultNewsURL = "https://newsapi.org/v2/top-headlines?sources=bbc-news,cnn,reuters,associated-press,abc-news,nbc-news,cbs-news,al-jazeera-english,dw,the-guardian-uk,france-24,independent&pageSize=50"
-	// DefaultNewsURLRU feeds the dashboard's Russian mode with Russian-language
-	// headlines. country=ru and language=ru return empty articles on the
-	// NewsAPI free plan, but the sources feed works (verified:
-	// sources=lenta,rbc,rt,google-news-ru returns the day's Russian headlines;
-	// the RU-language sources list has exactly these four entries).
+	// DefaultNewsURLRU feeds the dashboard's Russian mode. country=ru / language=ru
+	// return empty articles on the free plan, but the sources feed works
+	// (sources=lenta,rbc,rt,google-news-ru; verified).
 	DefaultNewsURLRU = "https://newsapi.org/v2/top-headlines?sources=lenta,rbc,rt,google-news-ru&pageSize=50"
 
 	defaultPlaceURL = "https://api.bigdatacloud.net/data/reverse-geocode-client"
 	defaultRatesURL = "https://api.exchangerate-api.com/v4/latest"
 	defaultTimeout  = 10 * time.Second
 	// maxNewsAge is the oldest publication date shown in the news card; the
-	// /everything upstream request also passes a matching `from` filter.
+	// /everything request also passes a matching `from` filter.
 	maxNewsAge = 48 * time.Hour
-	// maxBodyBytes caps a single upstream response so a misbehaving or
-	// compromised source can't balloon dashboard memory. All four upstreams
-	// return well under 1 MiB.
+	// maxBodyBytes caps a single upstream response so a misbehaving source
+	// can't balloon dashboard memory. All four upstreams return well under 1 MiB.
 	maxBodyBytes = 1 << 20
-	// DefaultPollInterval is how often the background poller refreshes the
-	// news stores from the upstream. Every cycle fetches both languages, so it
-	// costs two requests; 60m keeps the daily NewsAPI budget (100) well covered
-	// at 48 requests/day. The poll is the only dashboard-side news fetch, so
-	// the quota lasts all day instead of being spent by dashboard refreshes.
+	// DefaultPollInterval keeps the daily NewsAPI budget (100) well covered:
+	// two requests per cycle at 60m = 48/day. The poll is the only
+	// dashboard-side news fetch, so the quota lasts all day.
 	DefaultPollInterval = 60 * time.Minute
 )
 
@@ -75,11 +68,10 @@ type DashboardData struct {
 }
 
 // Handler aggregates weather, news and currency rates for /dashboard.
-// getSecret resolves a setting by name (e.g. "NEWS_API_KEY", "WEATHER_LOCATION",
-// "MAIN_CURRENCY") at request time; returning "" falls back to built-in defaults.
-// Nothing is fetched per request: /dashboard serves weather/place/rates from
-// the Redis store (kv, refreshed by the background poller) and news from the
-// news stores.
+// Nothing is fetched per request: weather/place/rates come from the Redis
+// snapshot store (kv, refreshed by the background poller) and news from the
+// news stores. getSecret resolves a setting by name at request time; returning
+// "" falls back to defaults.
 type Handler struct {
 	httpClient   *http.Client
 	logger       *slog.Logger
@@ -100,32 +92,26 @@ type Handler struct {
 }
 
 // NewsQuota gates upstream newsapi consumption so the daily free-plan budget
-// is shared between the /news route and the dashboard news block. A nil quota
-// disables the check.
+// is shared between the /news route and the dashboard news block. Nil disables.
 type NewsQuota interface {
 	Allow(ctx context.Context) (bool, error)
 }
 
-// NewsStore persists and replays newsapi articles so the dashboard can show
-// accumulated history instead of only the latest page. A nil store skips
-// persistence and the fresh page is returned as-is.
+// NewsStore persists and replays newsapi articles. Nil skips persistence.
 type NewsStore interface {
 	Store(ctx context.Context, articles []newsstore.Article) error
 	All(ctx context.Context) ([]newsstore.Article, error)
 }
 
 // Store is the narrow Redis-backed surface the dashboard reads weather, place
-// and rates from. A nil store disables the snapshot poller (and the dashboard
-// serves nothing for those cards). The main wiring uses a thin adapter over
-// *redis.Client; tests use an in-memory fake.
+// and rates from. Nil disables the snapshot poller. Tests use an in-memory fake.
 type Store interface {
 	Get(ctx context.Context, key string) (string, error)
 	Set(ctx context.Context, key string, value string, ttl time.Duration) error
 }
 
 // newsStatus records the outcome of the latest background news poll so the
-// dashboard can surface key, quota and upstream problems without hitting the
-// upstream itself. The zero value means the last poll succeeded.
+// dashboard can surface key, quota and upstream problems. Zero value = success.
 type newsStatus struct {
 	missingKey bool   // upstream reported a missing/invalid API key
 	exhausted  bool   // daily quota spent, poll skipped
@@ -189,10 +175,24 @@ func WithNewsPollInterval(f func(context.Context) time.Duration) Option {
 
 func New(getSecret func(context.Context, string) string, opts ...Option) *Handler {
 	h := &Handler{
-		// guardRedirects rejects upstream redirects into private ranges, so a
-		// public URL that 302s to an internal service or a cloud metadata
-		// endpoint can't turn the poller into an SSRF relay.
-		httpClient:   &http.Client{Timeout: 8 * time.Second, CheckRedirect: guardRedirects},
+		// Dial guard + redirect guard: a public URL (which a Redis secret can
+		// set) can't turn the poller into an SSRF relay, and DNS rebinding
+		// between the URL check and the connect can't slip a private address
+		// past the dial-time check.
+		httpClient: &http.Client{
+			Timeout:       8 * time.Second,
+			CheckRedirect: guardRedirects,
+			Transport: &http.Transport{
+				Proxy:                 http.ProxyFromEnvironment,
+				DialContext:           netguard.RestrictedDialContext(&net.Dialer{Timeout: 5 * time.Second}),
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          20,
+				MaxIdleConnsPerHost:   10,
+				IdleConnTimeout:       30 * time.Second,
+				ResponseHeaderTimeout: 10 * time.Second,
+				TLSHandshakeTimeout:   5 * time.Second,
+			},
+		},
 		logger:       slog.Default(),
 		getSecret:    getSecret,
 		weatherURL:   DefaultWeatherURL,
@@ -208,7 +208,6 @@ func New(getSecret func(context.Context, string) string, opts ...Option) *Handle
 	return h
 }
 
-// setNewsStatus records the outcome of the latest background news poll so the
 func (h *Handler) setNewsStatus(st newsStatus) {
 	h.statusMu.Lock()
 	defer h.statusMu.Unlock()
@@ -241,9 +240,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lat, lon := parseLocation(h.getSecret(ctx, "WEATHER_LOCATION"))
 	code, amount := h.baseCurrency(ctx)
 
-	// Nothing hits an upstream on a request: weather/place/rates are served
-	// from the Redis snapshot store (refreshed by the background poller on the
-	// same schedule as news) and news comes from its store.
+	// No upstream calls here: snapshots come from Redis, news from its store.
 	col.wg.Add(5)
 	go h.serveKV(ctx, col, "weather", h.weatherKey(lat, lon))
 	go h.serveKV(ctx, col, "place", h.placeKey(lat, lon))
@@ -265,8 +262,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(res)
 }
 
-// serveKV reads one snapshot (weather/place/rates) from the Redis store. A
-// missing key (first poll not finished, expired TTL) is silently skipped.
+// serveKV reads one snapshot from the Redis store. Missing keys are skipped.
 func (h *Handler) serveKV(ctx context.Context, col *collector, field, key string) {
 	defer col.wg.Done()
 	if h.kv == nil {
@@ -294,33 +290,26 @@ func (h *Handler) serveKV(ctx context.Context, col *collector, field, key string
 }
 
 func (h *Handler) weatherURLFor(lat, lon float64) string {
-	return h.addQueryOr(h.weatherURL, url.Values{
+	return addQuery(h.weatherURL, url.Values{
 		"latitude":        []string{strconv.FormatFloat(lat, 'f', 4, 64)},
 		"longitude":       []string{strconv.FormatFloat(lon, 'f', 4, 64)},
 		"current_weather": []string{"true"},
-		// Without timezone=auto open-meteo reports "GMT" and UTC times; with it
-		// the response carries the location's real IANA zone (e.g.
-		// "Europe/Moscow") and times in that zone's wall clock. The dashboard
-		// uses the zone to render news/check times and treats the weather time
-		// as a wall clock, so everything lines up with the location instead of
-		// drifting into GMT.
+		// timezone=auto gives the location's real IANA zone so the dashboard
+		// renders wall-clock times instead of drifting into GMT.
 		"timezone": []string{"auto"},
-		// Hourly forecast over today and tomorrow: temperature, condition and
-		// precipitation chance per hour, so the weather card can render a
-		// rolling next-N-hours strip. forecast_days=2 lets the strip run past
-		// midnight — in the evening its last slots fall on the next day, and
-		// without tomorrow the card would run dry after today's last hour
-		// (open-meteo defaults to 7 days, a waste of payload and Redis TTL).
+		// Forecast over today and tomorrow: hourly temperature, weather code
+		// and precipitation chance feed the next-N-hours strip. forecast_days=2
+		// lets the evening strip run past midnight (open-meteo defaults to 7
+		// days, a waste of payload and Redis TTL).
 		"hourly": []string{"temperature_2m,weathercode,precipitation_probability"},
-		// Sunrise/sunset for the same days, shown on the weather card. Each is
-		// one ISO string, negligible payload.
+		// Sunrise/sunset for the same days, shown on the weather card.
 		"daily":         []string{"sunrise,sunset"},
 		"forecast_days": []string{"2"},
 	})
 }
 
 func (h *Handler) placeURLFor(lat, lon float64) string {
-	return h.addQueryOr(h.placeURL, url.Values{
+	return addQuery(h.placeURL, url.Values{
 		"latitude":         []string{strconv.FormatFloat(lat, 'f', 6, 64)},
 		"longitude":        []string{strconv.FormatFloat(lon, 'f', 6, 64)},
 		"localityLanguage": []string{"en"},
@@ -338,11 +327,10 @@ func (h *Handler) newsURLForRU(ctx context.Context) string {
 	return h.newsURLForBase(ctx, h.urlOrSecret(ctx, "NEWS_API_URL_RU", h.newsURLRU))
 }
 
-// guardRedirects is the CheckRedirect for the aggregation HTTP client. The
-// news/weather/place/rates fetches follow redirects by default, so the
-// pre-fetch host check alone (isPublicUpstream) can be bypassed by a public
-// URL that redirects into a private network; this rejects every hop landing on
-// a non-public address and caps the chain length.
+// guardRedirects is the CheckRedirect for the aggregation HTTP client. A
+// public URL that redirects into a private network would bypass the pre-fetch
+// host check, so every hop onto a non-public address is rejected and the
+// chain length is capped.
 func guardRedirects(req *http.Request, via []*http.Request) error {
 	if len(via) >= 10 {
 		return errors.New("too many redirects")
@@ -357,10 +345,9 @@ func guardRedirects(req *http.Request, via []*http.Request) error {
 }
 
 // urlOrSecret resolves a Redis secret of name, falling back to the compiled
-// default (an empty secret value keeps the fallback). Secret-supplied values
-// are checked before use: a NEWS_API_URL pointed at an internal address would
-// turn the poller into an SSRF probe, so non-public hosts are rejected and the
-// built-in default is used instead.
+// default. Secret values are checked before use: a value pointed at an internal
+// address would turn the poller into an SSRF probe, so non-public hosts are
+// rejected and the default is used instead.
 func (h *Handler) urlOrSecret(ctx context.Context, name, fallback string) string {
 	v := h.getSecret(ctx, name)
 	if v == "" {
@@ -401,7 +388,7 @@ func (h *Handler) newsURLForBase(ctx context.Context, base string) string {
 	if k != "" {
 		params.Set("apiKey", k)
 	}
-	return h.addQueryOr(base, params)
+	return addQuery(base, params)
 }
 
 // currencyAmount matches a MAIN_CURRENCY value with an optional amount
@@ -409,8 +396,8 @@ func (h *Handler) newsURLForBase(ctx context.Context, base string) string {
 var currencyAmount = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([A-Za-z]{3})$`)
 
 // parseCurrency splits a MAIN_CURRENCY value into an ISO 4217 code and a base
-// amount: "100RUB" means rates are shown per 100 units of RUB, plain "RUB"
-// means per 1. Empty or invalid input falls back to USD with amount 1.
+// amount: "100RUB" means rates are shown per 100 units, plain "RUB" per 1.
+// Empty or invalid input falls back to USD with amount 1.
 func parseCurrency(v string) (code string, amount float64) {
 	v = strings.TrimSpace(v)
 	if m := currencyAmount.FindStringSubmatch(v); m != nil {
@@ -421,10 +408,9 @@ func parseCurrency(v string) (code string, amount float64) {
 	return strings.ToUpper(v), 1
 }
 
-// baseCurrency resolves MAIN_CURRENCY into a code and amount, applying the
-// same USD fallback as the poller so the dashboard always reads the exact
-// snapshot key the poller writes (an empty MAIN_CURRENCY must not produce a
-// different key than "USD").
+// baseCurrency resolves MAIN_CURRENCY with the same USD fallback as the
+// poller, so the dashboard always reads the exact snapshot key the poller
+// writes.
 func (h *Handler) baseCurrency(ctx context.Context) (code string, amount float64) {
 	code, amount = parseCurrency(h.getSecret(ctx, "MAIN_CURRENCY"))
 	if code == "" {
@@ -438,22 +424,12 @@ func (h *Handler) ratesURLFor(ctx context.Context) string {
 	return h.ratesURL + "/" + url.PathEscape(code)
 }
 
-// addQueryOr returns base with params merged in, or base unchanged when the
-// URL is unparseable.
-func (h *Handler) addQueryOr(base string, params url.Values) string {
-	u, err := addQuery(base, params)
-	if err != nil {
-		return base
-	}
-	return u
-}
-
-// addQuery merges params into base's existing query string, preserving any
-// params already present on the base URL.
-func addQuery(base string, params url.Values) (string, error) {
+// addQuery merges params into base's existing query string. An unparseable
+// base is returned unchanged.
+func addQuery(base string, params url.Values) string {
 	u, err := url.Parse(base)
 	if err != nil {
-		return "", err
+		return base
 	}
 	q := u.Query()
 	for k, vs := range params {
@@ -462,13 +438,12 @@ func addQuery(base string, params url.Values) (string, error) {
 		}
 	}
 	u.RawQuery = q.Encode()
-	return u.String(), nil
+	return u.String()
 }
 
 // parseLocation accepts a "lat,lon" location string. Invalid values — empty,
-// unparseable, NaN/Inf or out-of-range coordinates — fall back to the default
-// (Moscow 55.7558, 37.6173): a bad location must never be sent upstream (and
-// its error payload cached as a snapshot).
+// unparseable, NaN/Inf or out-of-range — fall back to the default (Moscow):
+// a bad location must never be sent upstream.
 func parseLocation(location string) (float64, float64) {
 	lat, lon := 55.7558, 37.6173
 	if parts := strings.Split(location, ","); len(parts) == 2 {
@@ -528,8 +503,8 @@ func newsError(code, message string) map[string]interface{} {
 	}
 }
 
-// isKeyErrCode reports whether a newsapi error code indicates a missing or
-// invalid API key.
+// isKeyErrCode reports whether a newsapi error code means a missing/invalid
+// API key.
 func isKeyErrCode(code string) bool {
 	switch code {
 	case "apiKeyMissing", "apiKeyInvalid", "apiKeyDisabled", "apiKeyExhausted", "apiKeyMissingOrInvalid":
@@ -539,8 +514,7 @@ func isKeyErrCode(code string) bool {
 }
 
 // fetchBody performs an upstream GET with a bounded read and returns the body
-// bytes plus the HTTP status. Errors cover URL construction, transport failures
-// and body reads; callers decide how to interpret the status code.
+// plus the HTTP status. Callers decide how to interpret the status code.
 func (h *Handler) fetchBody(ctx context.Context, url string) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -567,8 +541,7 @@ func (h *Handler) fetchStoreNews(ctx context.Context, col *collector) {
 }
 
 // fetchStoreNewsRU mirrors fetchStoreNews for the Russian-language store,
-// filling the newsRu dashboard field (omitted when the RU poller is not
-// configured).
+// filling the newsRu dashboard field.
 func (h *Handler) fetchStoreNewsRU(ctx context.Context, col *collector) {
 	h.fetchStoreNewsLang(ctx, col, true)
 }
@@ -602,10 +575,9 @@ func (h *Handler) fetchStoreNewsLang(ctx context.Context, col *collector, ru boo
 	}
 }
 
-// pollSnapshot refreshes the weather, place and rates snapshot keys in Redis.
-// It runs on the same cycle as the news polls, so the dashboard's non-news
-// cards are never fetched per request either. Failures keep the previous
-// value (the keys live on with their TTL) and are logged, never fatal.
+// pollSnapshot refreshes the weather, place and rates snapshot keys in Redis,
+// on the same cycle as the news polls. Failures keep the previous value (the
+// keys live on with their TTL) and are logged, never fatal.
 func (h *Handler) pollSnapshot(ctx context.Context) {
 	if h.kv == nil {
 		return
@@ -619,8 +591,8 @@ func (h *Handler) pollSnapshot(ctx context.Context) {
 }
 
 // snapshotTTL bounds how long a snapshot key survives without a refresh: two
-// poll intervals so a single failed cycle still serves, floored at 2h and
-// capped at 48h so a misconfigured huge interval can't pin stale data forever.
+// poll intervals, floored at 2h and capped at 48h so a misconfigured huge
+// interval can't pin stale data forever.
 func (h *Handler) snapshotTTL(ctx context.Context) time.Duration {
 	ttl := 2 * h.pollInterval(ctx)
 	if ttl < 2*time.Hour {
@@ -642,9 +614,8 @@ func (h *Handler) setSnapshot(ctx context.Context, key, value string) {
 }
 
 // pollWeather stores the open-meteo snapshot for the configured location. An
-// error payload (open-meteo answers with {"error":true,"reason":...} and a 2xx
-// status for invalid parameters) is treated like any other failed poll so it
-// never gets cached as a valid snapshot.
+// error payload ({"error":true,...} with a 2xx status) is treated like any
+// other failed poll so it never gets cached as a valid snapshot.
 func (h *Handler) pollWeather(ctx context.Context) {
 	lat, lon := parseLocation(h.getSecret(ctx, "WEATHER_LOCATION"))
 	body, status, err := h.fetchBody(ctx, h.weatherURLFor(lat, lon))
@@ -736,17 +707,13 @@ func (h *Handler) pollNews(ctx context.Context) {
 	h.pollNewsLang(ctx, false)
 }
 
-// pollNewsRU mirrors pollNews for the Russian-language store (sources
-// lenta,rbc,rt). Both languages are polled on every cycle, so the poll
-// interval must be sized so two requests per cycle stay within the daily
-// budget.
+// pollNewsRU mirrors pollNews for the Russian-language store.
 func (h *Handler) pollNewsRU(ctx context.Context) {
 	h.pollNewsLang(ctx, true)
 }
 
 func (h *Handler) pollNewsLang(ctx context.Context, ru bool) {
-	// RU polling is optional: without a RU store there is nothing to persist
-	// and no dashboard field to fill, so skip the fetch (and the quota unit).
+	// RU polling is optional: without a RU store there is nothing to persist.
 	if ru && h.newsStoreRU == nil {
 		return
 	}
@@ -765,9 +732,8 @@ func (h *Handler) pollNewsLang(ctx context.Context, ru bool) {
 		allowed, err := h.newsQuota.Allow(ctx)
 		if err != nil {
 			// Fail closed on a broken quota backend: with the budget unknown
-			// the poll must not spend it blindly — a poller overshoot would
-			// exhaust the daily NewsAPI quota for everyone. Skip this cycle,
-			// keep the last good status, and let the next cycle retry.
+			// the poll must not spend it blindly — an overshoot would exhaust
+			// the daily NewsAPI quota for everyone.
 			h.logger.Warn("news: poll skipped, quota check failed", "ru", ru, "err", err)
 			return
 		}
@@ -835,13 +801,10 @@ func (h *Handler) pollNewsLang(ctx context.Context, ru bool) {
 }
 
 // Run polls the upstreams on a fixed cycle: news (EN, and RU when a store is
-// configured) plus the weather/place/rates snapshot, stored in Redis so the
-// dashboard serves everything without spending the daily quota or upstream
-// budget on refresh. Every cycle fetches both languages — two news requests
-// per interval — plus three snapshot requests; the default interval is sized
-// so the free-plan daily budget lasts. The interval is re-resolved each
-// cycle (e.g. from a NEWS_POLL_INTERVAL secret); the first poll runs
-// immediately.
+// configured) plus the weather/place/rates snapshot, all stored in Redis so
+// the dashboard serves everything without spending the daily quota or
+// upstream budget per request. The interval is re-resolved each cycle (e.g.
+// from a NEWS_POLL_INTERVAL secret); the first poll runs immediately.
 func (h *Handler) Run(ctx context.Context) {
 	if h.newsStore == nil && h.kv == nil {
 		h.logger.Warn("news: poller disabled, no store configured")
@@ -867,8 +830,7 @@ func (h *Handler) Run(ctx context.Context) {
 
 // pollAll refreshes both language stores and the weather/rates snapshot
 // concurrently. Each news language still consumes one unit of the shared
-// daily quota via its own Allow call; RU polling is a no-op when no RU store
-// is configured.
+// daily quota via its own Allow call.
 func (h *Handler) pollAll(ctx context.Context) {
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -880,31 +842,17 @@ func (h *Handler) pollAll(ctx context.Context) {
 
 // PollNow refreshes the news stores and the weather/place/rates snapshots in
 // the background, outside the scheduled cycle. The API Secrets UI calls it
-// after a data-affecting secret changes, so the dashboard reflects a new
-// location, currency or news upstream/key immediately instead of on the next
-// poll. It is fire-and-forget and safe to run concurrently with the scheduled
-// cycle: every fetch is bounded by the client timeout and the news quota stays
-// atomic.
+// after a data-affecting secret changes so the dashboard reflects the new
+// value immediately. It is fire-and-forget and safe to run concurrently with
+// the scheduled cycle.
 func (h *Handler) PollNow() {
 	h.logger.Info("news: immediate refresh triggered")
 	go h.pollAll(context.Background())
 }
 
-// ParseInterval converts a Go duration string (e.g. "30m", "6m 30s") into a
-// poll interval, falling back to DefaultPollInterval on empty or invalid input.
-func ParseInterval(v string) time.Duration {
-	if d, err := time.ParseDuration(strings.Join(strings.Fields(v), "")); err == nil && d > 0 {
-		return d
-	}
-	return DefaultPollInterval
-}
-
 // filterRecentArticles drops articles older than maxNewsAge so the card stays
-// focused on current headlines even when the store still holds older entries.
-// Articles whose date can't be parsed are kept and treated as fresh: the store
-// already scores them as "just now" (publishedScore), and several upstreams
-// (e.g. lenta) omit publishedAt entirely — dropping them would hide real
-// headlines for the sake of an unknown timestamp.
+// focused on current headlines. Articles whose date can't be parsed are kept
+// and treated as fresh (several upstreams, e.g. lenta, omit publishedAt).
 func filterRecentArticles(articles []newsstore.Article) []newsstore.Article {
 	cutoff := time.Now().Add(-maxNewsAge)
 	out := make([]newsstore.Article, 0, len(articles))
@@ -922,8 +870,8 @@ func filterRecentArticles(articles []newsstore.Article) []newsstore.Article {
 	return out
 }
 
-// newsResponseData wraps a stored article list in a newsapi-shaped response so
-// the frontend renderer keeps working unchanged.
+// newsResponseData wraps a stored article list in a newsapi-shaped response
+// so the frontend renderer keeps working unchanged.
 func newsResponseData(articles []newsstore.Article) map[string]interface{} {
 	return map[string]interface{}{
 		"status":       "ok",
@@ -939,8 +887,8 @@ type collector struct {
 	res *DashboardData
 }
 
-// set writes field's value under the mutex. The "place" field is special: it
-// takes the pre-extracted locality string from the snapshot read.
+// set writes field's value under the mutex. "place" takes the pre-extracted
+// locality string from the snapshot read.
 func (c *collector) set(field string, v interface{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

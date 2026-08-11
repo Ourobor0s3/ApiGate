@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 
@@ -16,6 +17,24 @@ var validName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 // hundred bytes at most), so one bad write can't plant a huge value that every
 // request would then re-read into memory.
 const maxSecretValue = 8 << 10
+
+// redactAPIKeyParam strips an apiKey query parameter from a URL-shaped value
+// before it is listed, so a key embedded in an upstream URL (e.g. a
+// NEWS_API_URL with ?apiKey=...) is never echoed back by /api/secrets.
+// Non-URL values pass through untouched.
+func redactAPIKeyParam(v string) string {
+	u, err := url.Parse(v)
+	if err != nil || u.Scheme == "" {
+		return v
+	}
+	q := u.Query()
+	if q.Get("apiKey") == "" {
+		return v
+	}
+	q.Del("apiKey")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
 
 type Store struct {
 	rdb *redis.Client
@@ -137,10 +156,10 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 		}
 		if !s.Masked {
 			if s.Env != "" {
-				row["env"] = s.Env
+				row["env"] = redactAPIKeyParam(s.Env)
 			}
 			if v, err := h.store.Get(r.Context(), s.Name); err == nil && v != "" {
-				row["value"] = v
+				row["value"] = redactAPIKeyParam(v)
 			}
 		}
 		settings = append(settings, row)

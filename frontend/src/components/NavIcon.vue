@@ -1,5 +1,4 @@
 <script setup>
-// Minimal stroke icon set (GitLab-style 16px), one per nav item.
 defineProps({ name: { type: String, required: true } });
 </script>
 

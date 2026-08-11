@@ -18,6 +18,7 @@ import (
 	"github.com/Ourobor0s3/ApiGate/internal/aggregation"
 	"github.com/Ourobor0s3/ApiGate/internal/cache"
 	"github.com/Ourobor0s3/ApiGate/internal/checks"
+	"github.com/Ourobor0s3/ApiGate/internal/interval"
 	"github.com/Ourobor0s3/ApiGate/internal/middleware"
 	"github.com/Ourobor0s3/ApiGate/internal/newsstore"
 	"github.com/Ourobor0s3/ApiGate/internal/notify"
@@ -68,10 +69,9 @@ func run(ctx context.Context) error {
 		return os.Getenv(name)
 	}
 
-	// newsUpstream defaults: the dashboard keeps its built-in default
-	// upstreams even when the env var is set empty to disable the public
-	// proxy route. Each may be overridden at runtime via a Redis secret of
-	// the same name (poll-time), which the aggregation layer resolves.
+	// Empty NEWS_API_URL/WEATHER_API_URL disable only the public proxy routes;
+	// the dashboard keeps its built-in upstreams and can still switch news
+	// sources via Redis secrets at poll time (see the aggregation options).
 	weatherAPI := os.Getenv("WEATHER_API_URL")
 	newsAPIUpstreamEnv := os.Getenv("NEWS_API_URL")
 	newsURL := envOrDefault("NEWS_API_URL", aggregation.DefaultNewsURL)
@@ -124,10 +124,6 @@ func run(ctx context.Context) error {
 	})
 
 	agg := aggregation.New(getSecret,
-		// The dashboard keeps its built-in default upstreams (or the env
-		// override) even when the env var is set empty to disable the public
-		// proxy route. NEWS_API_URL/NEWS_API_URL_RU additionally resolve a
-		// Redis secret of the same name at request/poll time.
 		aggregation.WithWeatherURL(envOrDefault("WEATHER_API_URL", aggregation.DefaultWeatherURL)),
 		aggregation.WithNewsURL(newsURL),
 		aggregation.WithNewsURLRU(newsURLRU),
@@ -139,13 +135,13 @@ func run(ctx context.Context) error {
 		// cycle, so no dashboard request ever spends an upstream budget.
 		aggregation.WithKV(snapshotStore{rdb}),
 		aggregation.WithNewsPollInterval(func(ctx context.Context) time.Duration {
-			return aggregation.ParseInterval(getSecret(ctx, "NEWS_POLL_INTERVAL"))
+			return interval.Parse(getSecret(ctx, "NEWS_POLL_INTERVAL"), aggregation.DefaultPollInterval)
 		}),
 	)
 
 	chk := checks.New(rdb, checks.Config{
 		Interval: func(ctx context.Context) time.Duration {
-			return checks.ParseInterval(getSecret(ctx, "CHECK_INTERVAL"))
+			return interval.Parse(getSecret(ctx, "CHECK_INTERVAL"), checks.DefaultInterval)
 		},
 		OnStatusChange: func(ctx context.Context, url string, from, to checks.Status) {
 			state := "down"
@@ -160,8 +156,8 @@ func run(ctx context.Context) error {
 				"latencyMs": to.LatencyMs,
 				"checkedAt": to.CheckedAt,
 			}
-			// Fire-and-forget: the webhook is a side effect and a slow endpoint
-			// must not stall the probe loop or a "check now" request.
+			// Fire-and-forget: a slow webhook endpoint must not stall the
+			// probe loop or a "check now" request.
 			go func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
@@ -178,8 +174,6 @@ func run(ctx context.Context) error {
 	mux.Handle("GET /healthz", middleware.Health(rdb, logger))
 	mux.Handle("GET /api/newsquota", newsQuotaHandler(newsQuota))
 	secrets.NewHandler(store, []secrets.Setting{
-		// Every runtime-configurable variable, with its default/environment
-		// value, surfaced on the API Secrets page for the UI.
 		{Name: "NEWS_API_KEY", Masked: true},
 		{Name: "WEATHER_LOCATION", Default: "55.7558,37.6173", Env: os.Getenv("WEATHER_LOCATION")},
 		{Name: "MAIN_CURRENCY", Default: "USD", Env: os.Getenv("MAIN_CURRENCY")},
@@ -301,8 +295,7 @@ func (s snapshotStore) Set(ctx context.Context, key, value string, ttl time.Dura
 // refreshOnSecret reports whether a changed secret invalidates served data.
 // A new location, currency, news upstream or API key must show up on the
 // dashboard immediately, so writes to these names trigger an immediate
-// background refresh; schedule-only settings (NEWS_POLL_INTERVAL,
-// CHECK_INTERVAL) pick up on their next cycle on their own.
+// background refresh; schedule-only settings pick up on their next cycle.
 func refreshOnSecret(name string) bool {
 	switch name {
 	case "NEWS_API_KEY", "WEATHER_LOCATION", "MAIN_CURRENCY":

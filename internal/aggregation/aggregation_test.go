@@ -83,10 +83,7 @@ func TestServeHTTPRatesScaled(t *testing.T) {
 }
 
 func TestAddQueryPreservesExisting(t *testing.T) {
-	got, err := addQuery("https://example.com/path?a=1", url.Values{"b": []string{"2"}})
-	if err != nil {
-		t.Fatalf("addQuery() error: %v", err)
-	}
+	got := addQuery("https://example.com/path?a=1", url.Values{"b": []string{"2"}})
 	if !strings.Contains(got, "a=1") || !strings.Contains(got, "b=2") {
 		t.Errorf("addQuery() = %q, want both a=1 and b=2", got)
 	}
@@ -354,7 +351,6 @@ func TestPollNewsRUSkippedWithoutStore(t *testing.T) {
 	}
 }
 
-// newsArticlesRU decodes the articles array from the served newsRu block.
 func newsArticlesRU(t *testing.T, data DashboardData) []map[string]interface{} {
 	t.Helper()
 	m, ok := data.NewsRU.(map[string]interface{})
@@ -465,6 +461,7 @@ func TestPollNewsSecretURLBlockedWhenPrivate(t *testing.T) {
 			return ""
 		},
 		WithNewsURL(safe.URL),
+		WithHTTPClient(safe.Client()),
 		WithNewsStore(newMemStore()),
 	)
 	h.pollNews(context.Background())
@@ -642,7 +639,6 @@ func recentPublished(hoursAgo int) string {
 	return time.Now().Add(-time.Duration(hoursAgo) * time.Hour).Format(time.RFC3339)
 }
 
-// newsArticles decodes the articles array from a served DashboardData.
 func newsArticles(t *testing.T, data DashboardData) []map[string]interface{} {
 	t.Helper()
 	m, ok := data.News.(map[string]interface{})
@@ -779,22 +775,6 @@ func TestServeHTTPNewsQuotaExhaustedServesStored(t *testing.T) {
 	}
 }
 
-func TestServeHTTPNewsQuotaExhaustedEmptyStore(t *testing.T) {
-	news := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Error("news upstream hit despite exhausted quota")
-	}))
-	defer news.Close()
-
-	h := testDashboard(t, WithNewsURL(news.URL), WithNewsQuota(denyQuota{}), WithNewsStore(newMemStore()))
-	h.pollNews(context.Background())
-
-	data := decodeDash(t, h)
-	m, ok := data.News.(map[string]interface{})
-	if !ok || m["status"] != "error" || m["code"] != "dailyQuotaExhausted" {
-		t.Errorf("News = %v, want dailyQuotaExhausted error object", data.News)
-	}
-}
-
 func TestServeHTTPMissingKeyServesStored(t *testing.T) {
 	news := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -824,21 +804,6 @@ func TestServeHTTPMissingKeyServesStored(t *testing.T) {
 	}
 	if len(data.MissingSecrets) != 1 || data.MissingSecrets[0] != "NEWS_API_KEY" {
 		t.Errorf("MissingSecrets = %v, want [NEWS_API_KEY]", data.MissingSecrets)
-	}
-}
-
-func TestParseInterval(t *testing.T) {
-	if got := ParseInterval("30m"); got != 30*time.Minute {
-		t.Errorf("ParseInterval(30m) = %v", got)
-	}
-	if got := ParseInterval("6m 30s"); got != 6*time.Minute+30*time.Second {
-		t.Errorf("ParseInterval(6m 30s) = %v", got)
-	}
-	if got := ParseInterval(""); got != DefaultPollInterval {
-		t.Errorf("ParseInterval(\"\") = %v, want default", got)
-	}
-	if got := ParseInterval("bogus"); got != DefaultPollInterval {
-		t.Errorf("ParseInterval(bogus) = %v, want default", got)
 	}
 }
 

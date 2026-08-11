@@ -65,9 +65,8 @@ func TestStorableArticlesSkipsOversized(t *testing.T) {
 	normal := Article{URL: "https://x.com/a", Title: "A"}
 	huge := Article{URL: "https://x.com/b", Title: "B", Content: strings.Repeat("x", maxArticleBytes)}
 	noURL := Article{Title: "no url"}
-	badURL := Article{URL: "", Title: "also no url"}
 
-	got := storableArticles([]Article{normal, huge, noURL, badURL})
+	got := storableArticles([]Article{normal, huge, noURL})
 	if len(got) != 1 {
 		t.Fatalf("storableArticles() kept %d articles, want 1 (the normal one)", len(got))
 	}

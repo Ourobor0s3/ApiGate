@@ -251,18 +251,18 @@ func TestStaleServedWhileRevalidating(t *testing.T) {
 
 	// The background refresh must re-store a fresh copy shortly after.
 	deadline := time.Now().Add(time.Second)
-	for !bytes.Contains(storedBody(fake, "cache:GET:/weather"), []byte("fresh")) {
+	for {
+		fake.mu.Lock()
+		stored := fake.data["cache:GET:/weather"]
+		fake.mu.Unlock()
+		if bytes.Contains(stored, []byte("fresh")) {
+			break
+		}
 		if time.Now().After(deadline) {
 			t.Fatal("background refresh did not re-store a fresh entry")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-}
-
-func storedBody(f *fakeRedis, key string) []byte {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.data[key]
 }
 
 // TestStoreTTLIncludesSWR guards the SWR storage contract: entries must live

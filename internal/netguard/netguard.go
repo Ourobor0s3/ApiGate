@@ -5,9 +5,41 @@ package netguard
 
 import (
 	"context"
+	"errors"
 	"net"
 	"time"
 )
+
+// ErrBlocked reports a refused connection to a non-public address, returned by
+// RestrictedDialContext.
+var ErrBlocked = errors.New("blocked address")
+
+// RestrictedDialContext returns a DialContext that refuses connections to
+// loopback/private/link-local addresses at dial time (SSRF guard). A
+// resolution-time check alone can be bypassed by DNS rebinding, where a name
+// answers with public addresses for the check and private addresses when the
+// connection is actually dialed; the guard runs inside Dial, so every connect
+// re-validates the freshly resolved addresses. Names that fail to resolve are
+// passed through — the fetch itself surfaces the failure.
+func RestrictedDialContext(base *net.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	if base == nil {
+		base = &net.Dialer{}
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		if ips, err := net.LookupIP(host); err == nil {
+			for _, ip := range ips {
+				if BlockedIP(ip) {
+					return nil, ErrBlocked
+				}
+			}
+		}
+		return base.DialContext(ctx, network, addr)
+	}
+}
 
 // BlockedIP reports whether ip is a non-public address: loopback, private,
 // link-local (unicast/multicast) or unspecified. These are the ranges no

@@ -14,6 +14,17 @@ go run ./cmd/apigate               # serves API + UI on :8080
 
 Open http://localhost:8080. The sidebar splits the UI into pages: **Overview** (weather, currency rates), **News** (EN/RU headlines + the NewsAPI budget bar; follows the UI language), **Site Checks**, **API Secrets**. The EN/RU switch in the header is remembered per browser. Without the frontend build the server serves a stub page that says so.
 
+## Docker
+
+```bash
+docker compose up --build -d    # builds the image, starts Redis + the gateway
+docker compose logs -f apigate
+docker compose down             # stop (Redis data volume persists)
+docker compose down -v          # stop and wipe stored secrets/settings
+```
+
+Open http://localhost:8083. The image is multi-stage (Node-built SPA + static Go binary in a non-root alpine runtime; only binary + `frontend/dist` inside). The gateway starts only after Redis is healthy; secrets saved in the 🔑 API Secrets UI survive restarts via the `redis-data` volume.
+
 ## API keys
 
 Only NewsAPI needs a key (free plan: 100 requests/24h). Register at https://newsapi.org and save `NEWS_API_KEY` in the 🔑 **API Secrets** page (stored in Redis, applied without a restart) or set the env var. Without a key the news card shows an error; when the shared daily budget (`NEWS_DAILY_LIMIT`, env-only) is spent, `/news` returns 429 and the news card shows an error — weather and rates keep working. The counter resets at midnight local time.

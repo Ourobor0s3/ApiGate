@@ -16,8 +16,6 @@ const label = computed(() => cond.value || (props.weather?.current_weather ? 'Co
 const cw = computed(() => props.weather?.current_weather || {});
 const title = computed(() => t('card.weather') + (props.place ? ' — ' + props.place : ''));
 
-// Rows rendered as a plain table so the label/value columns stay aligned
-// regardless of language (long RU words never push values around).
 const location = computed(() => {
   const w = props.weather;
   if (!w || w.latitude == null) return null;
@@ -28,12 +26,8 @@ const elevation = computed(() => props.weather?.elevation != null ? `${props.wea
 const updated = computed(() => fmtWallClock(cw.value.time, true));
 
 // Rolling hourly forecast: from the current hour on, up to HOURS entries.
-// The poller fetches two forecast days, so the 12 slots stay full into the
-// next day — in the evening the strip crosses midnight instead of running
-// dry (or wrapping onto a second row). Times are the location's local wall
-// clock (timezone=auto), so the day/night icon is guessed from the raw hour
-// number, matching how the UI treats the weather timestamps. Old snapshots
-// cached before the hourly data existed simply render no strip.
+// Two forecast days keep the strip full across midnight; wall-clock times
+// (timezone=auto) drive the day/night icon from the raw hour.
 const HOURS = 12;
 const DAY_START = 7;
 const DAY_END = 19;

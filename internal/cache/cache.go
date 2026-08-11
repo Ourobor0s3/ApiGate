@@ -14,6 +14,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// Config configures the cache.
 type Config struct {
 	DefaultTTL   int64
 	RouteTTLs    map[string]int64
@@ -60,6 +61,7 @@ func (c *Cache) storeTTL(path string) time.Duration {
 	return time.Duration(c.ttlFor(path))*time.Second + c.cfg.StaleWhileRevalidate
 }
 
+// middleware serves cached GET responses and fills the cache on misses.
 func (c *Cache) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || !c.shouldCache(r.URL.Path) {
@@ -73,7 +75,7 @@ func (c *Cache) Middleware(next http.Handler) http.Handler {
 		if data, err := c.rdb.Get(ctx, key).Bytes(); err == nil {
 			resp, derr := decodeResponse(data)
 			if derr == nil {
-				if resp.Header("X-Fetched-At") != "" {
+				if resp.Headers.Get("X-Fetched-At") != "" {
 					stale := isStale(resp, c.ttlFor(r.URL.Path))
 					if stale && c.cfg.StaleWhileRevalidate > 0 {
 						// Serve the stale copy now and refresh in the background
@@ -97,9 +99,9 @@ func (c *Cache) Middleware(next http.Handler) http.Handler {
 		if cr.code == 0 {
 			cr.code = http.StatusOK
 		}
-		// Cache only successful responses: a 3xx that fell through (e.g. an
-		// inaccessible redirect) is not worth replaying to every caller, and an
-		// oversized body was streamed but never buffered.
+		// Cache only successful responses: a 3xx that fell through is not
+		// worth replaying, and an oversized body was streamed but never
+		// buffered.
 		if cr.code < 200 || cr.code >= 300 || cr.overflow {
 			return
 		}
@@ -136,7 +138,7 @@ func isStale(resp *cachedResponse, ttl int64) bool {
 	if ttl <= 0 {
 		return false
 	}
-	t, err := time.Parse(time.RFC3339, resp.Header("X-Fetched-At"))
+	t, err := time.Parse(time.RFC3339, resp.Headers.Get("X-Fetched-At"))
 	if err != nil {
 		return false
 	}
@@ -159,8 +161,7 @@ func (c *Cache) refresh(key string, r *http.Request, next http.Handler) {
 	if cr.code == 0 {
 		cr.code = http.StatusOK
 	}
-	// Mirror the MISS path: only successful, bounded responses are worth
-	// re-storing.
+	// Mirror the MISS path: only successful, bounded responses are stored.
 	if cr.code < 200 || cr.code >= 300 || cr.overflow {
 		return
 	}
@@ -175,8 +176,7 @@ func (c *Cache) refresh(key string, r *http.Request, next http.Handler) {
 // refresh of the same key is already in flight so a burst of stale requests
 // maps to a single upstream call instead of one per request. Panics inside the
 // refresh chain are contained: the cache sits inside the Recover middleware,
-// but this goroutine calls the chain below the cache directly, so nothing else
-// would catch them.
+// but this goroutine calls the chain below the cache directly.
 func (c *Cache) refreshAsync(key string, r *http.Request, next http.Handler) {
 	c.mu.Lock()
 	if c.refreshing[key] {
@@ -201,13 +201,10 @@ func (c *Cache) refreshAsync(key string, r *http.Request, next http.Handler) {
 	}()
 }
 
-// Header returns the first value of the named header, or "".
-func (resp *cachedResponse) Header(name string) string { return resp.Headers.Get(name) }
-
-// storableHeaders clones response headers, dropping ones that are per-response
-// or would corrupt a cached copy: Date (stale timestamp), X-Cache (recomputed
-// on every serve), Content-Encoding and Content-Length (the stored body is the
-// raw uncompressed bytes, gzip is applied per-request outside the cache).
+// storableHeaders clones response headers, dropping per-response ones that
+// would corrupt a cached copy: Date (stale timestamp), X-Cache (recomputed on
+// every serve), Content-Encoding and Content-Length (the stored body is the
+// raw uncompressed bytes; gzip is applied per-request outside the cache).
 func storableHeaders(h http.Header) http.Header {
 	clone := h.Clone()
 	clone.Del("Date")
