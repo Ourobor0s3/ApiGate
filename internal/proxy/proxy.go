@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bufio"
+	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
 	"context"
@@ -18,14 +20,11 @@ type Config struct {
 	WeatherAPI string
 	NewsAPI    string
 	// NewsAPIKey, if set, resolves an API key per request and appends it as
-	// the `apiKey` query param on the /news route when one isn't already set.
+	// the `apiKey` query param on /news when one isn't already set.
 	NewsAPIKey func(context.Context) string
-	// Breaker, if set, wraps each upstream transport in a circuit breaker.
-	Breaker BreakerConfig
+	Breaker    BreakerConfig
 }
 
-// Proxy holds the upstream reverse proxies. Route registration is exact on the
-// mux (GET /weather, GET /news), so no prefix matching is needed here.
 type Proxy struct {
 	weather *httputil.ReverseProxy
 	news    *httputil.ReverseProxy
@@ -51,13 +50,13 @@ func New(cfg Config) (*Proxy, error) {
 }
 
 // Weather returns the /weather upstream handler, or http.NotFound when the
-// route has no target URL (empty WEATHER_API_URL).
+// route has no target URL.
 func (p *Proxy) Weather() http.Handler {
 	return handlerOrNotFound(p.weather)
 }
 
 // News returns the /news upstream handler, or http.NotFound when the route has
-// no target URL (empty NEWS_API_URL).
+// no target URL.
 func (p *Proxy) News() http.Handler {
 	return handlerOrNotFound(p.news)
 }
@@ -69,8 +68,7 @@ func handlerOrNotFound(rp *httputil.ReverseProxy) http.Handler {
 	return rp
 }
 
-// newReverseProxy builds a proxy for prefix; an empty target silently disables
-// the route (returns nil, nil) so the mux falls back to http.NotFound.
+// An empty target silently disables the route.
 func newReverseProxy(prefix, target string, params map[string]func(context.Context) string, transport http.RoundTripper, breaker BreakerConfig) (*httputil.ReverseProxy, error) {
 	if target == "" {
 		return nil, nil
@@ -92,16 +90,13 @@ func newReverseProxy(prefix, target string, params map[string]func(context.Conte
 			req.URL.RawPath = ""
 			req.Host = targetURL.Host
 
-			// The gateway applies compression itself (the Gzip middleware), so ask
-			// the upstream for identity encoding. Otherwise the client's
-			// Accept-Encoding: gzip would be forwarded upstream and the
-			// compressed bytes it returns would be cached (and later
-			// re-compressed) as if they were the raw body.
+			// The gateway applies compression itself (Gzip middleware), so ask
+			// the upstream for identity; otherwise compressed bytes would be
+			// cached and re-compressed as if they were the raw body.
 			req.Header.Set("Accept-Encoding", "identity")
 
-			// Merge query params baked into the target URL (e.g. ?country=us),
-			// letting the request's own params take precedence; then fill in any
-			// param resolvers (the news apiKey). Encode once at the end.
+			// Merge target URL params (e.g. ?country=us) without overriding
+			// the request's own, then fill in param resolvers (the apiKey).
 			rq := req.URL.Query()
 			for k, vs := range targetURL.Query() {
 				if _, ok := rq[k]; !ok {
@@ -118,10 +113,9 @@ func newReverseProxy(prefix, target string, params map[string]func(context.Conte
 			}
 			req.URL.RawQuery = rq.Encode()
 		},
-		// An upstream that ignores the identity request would otherwise leak
-		// a stale Content-Encoding into the body; every downstream layer
-		// (cache, gzip) assumes the body is the raw representation, so any
-		// compression is undone here.
+		// An upstream that compresses despite the identity request would
+		// hand back encoded bytes the cache would store as raw; undo any
+		// declared compression here.
 		ModifyResponse: func(resp *http.Response) error {
 			return decodeBody(resp)
 		},
@@ -129,12 +123,9 @@ func newReverseProxy(prefix, target string, params map[string]func(context.Conte
 	}, nil
 }
 
-// decodeBody unwraps an upstream response back to its raw representation. The
-// gateway asks for `Accept-Encoding: identity` and caches the returned bytes
-// as-is, so a misbehaving upstream that compresses anyway would have its
-// compressed bytes stored and served to clients as if they were the raw body.
-// Only the declared encoding is removed; unknown or already-decompressed
-// bodies pass through untouched.
+// decodeBody unwraps a declared upstream compression back to the raw
+// representation; unknown encodings pass through untouched rather than risk
+// mislabeling them.
 func decodeBody(resp *http.Response) error {
 	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
 	switch enc {
@@ -147,14 +138,23 @@ func decodeBody(resp *http.Response) error {
 		}
 		resp.Body = &readCloser{Reader: zr, closer: resp.Body}
 	case "deflate":
-		zr, err := zlib.NewReader(resp.Body)
-		if err != nil {
-			return err
+		// Some upstreams declare "deflate" but send raw DEFLATE without the
+		// zlib wrapper. Peek at the stream header: a valid zlib block has
+		// CM=8 and (CMF<<8|FLG) divisible by 31; anything else is decoded as
+		// raw deflate instead of failing the whole response.
+		br := bufio.NewReader(resp.Body)
+		var r io.Reader
+		if head, _ := br.Peek(2); len(head) == 2 && head[0]&0x0f == 8 && (uint16(head[0])<<8|uint16(head[1]))%31 == 0 {
+			zr, err := zlib.NewReader(br)
+			if err != nil {
+				return err
+			}
+			r = zr
+		} else {
+			r = flate.NewReader(br)
 		}
-		resp.Body = &readCloser{Reader: zr, closer: resp.Body}
+		resp.Body = &readCloser{Reader: r, closer: resp.Body}
 	default:
-		// "identity", "br", "compress" and anything else: keep the body wired
-		// through unchanged rather than risk mislabeling it.
 		if enc == "identity" {
 			resp.Header.Del("Content-Encoding")
 		}
@@ -166,9 +166,8 @@ func decodeBody(resp *http.Response) error {
 	return nil
 }
 
-// readCloser pairs a decompressing reader with the upstream body it is reading
-// from, so the underlying connection is still closed when the response is
-// consumed.
+// readCloser pairs a decompressing reader with the upstream body so the
+// underlying connection is still closed.
 type readCloser struct {
 	io.Reader
 	closer io.Closer
@@ -187,5 +186,8 @@ func newTransport() http.RoundTripper {
 		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       30 * time.Second,
 		ResponseHeaderTimeout: 10 * time.Second,
+		// ResponseHeaderTimeout only starts after TLS completes; without this
+		// bound a stalled handshake pins the request until the client leaves.
+		TLSHandshakeTimeout: 5 * time.Second,
 	}
 }

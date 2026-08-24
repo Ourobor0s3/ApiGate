@@ -1,13 +1,85 @@
 package proxy
 
 import (
+	"bytes"
+	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+// decodeBody must hand the raw representation downstream for every encoding a
+// misbehaving upstream might declare, including raw-DEFLATE-masquerading-as-
+// "deflate", and leave unknown encodings untouched.
+func TestDecodeBody(t *testing.T) {
+	plain := []byte("hello gateway")
+
+	var gzBuf, zlBuf, rawBuf bytes.Buffer
+	gw := gzip.NewWriter(&gzBuf)
+	gw.Write(plain)
+	gw.Close()
+	zw := zlib.NewWriter(&zlBuf)
+	zw.Write(plain)
+	zw.Close()
+	fw, _ := flate.NewWriter(&rawBuf, flate.DefaultCompression)
+	fw.Write(plain)
+	fw.Close()
+
+	cases := []struct {
+		name string
+		enc  string
+		body []byte
+	}{
+		{"gzip", "gzip", gzBuf.Bytes()},
+		{"x-gzip", "x-gzip", gzBuf.Bytes()},
+		{"zlib deflate", "deflate", zlBuf.Bytes()},
+		{"raw deflate", "deflate", rawBuf.Bytes()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{
+				Header:        http.Header{"Content-Encoding": []string{tc.enc}},
+				Body:          io.NopCloser(bytes.NewReader(tc.body)),
+				ContentLength: int64(len(tc.body)),
+			}
+			if err := decodeBody(resp); err != nil {
+				t.Fatalf("decodeBody: %v", err)
+			}
+			got, err := io.ReadAll(resp.Body)
+			if err != nil || !bytes.Equal(got, plain) {
+				t.Fatalf("decoded %q err=%v, want %q", got, err, plain)
+			}
+			if resp.Header.Get("Content-Encoding") != "" {
+				t.Error("Content-Encoding not removed")
+			}
+		})
+	}
+
+	// identity is stripped as a no-op marker; unknown encodings (br) pass
+	// through with their header intact rather than being mislabeled.
+	for enc, wantKept := range map[string]bool{"identity": false, "br": true} {
+		resp := &http.Response{
+			Header:        http.Header{"Content-Encoding": []string{enc}},
+			Body:          io.NopCloser(bytes.NewReader(plain)),
+			ContentLength: int64(len(plain)),
+		}
+		if err := decodeBody(resp); err != nil {
+			t.Fatalf("%s: decodeBody: %v", enc, err)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		if !bytes.Equal(got, plain) {
+			t.Errorf("%s: body changed to %q", enc, got)
+		}
+		if gotEnc := resp.Header.Get("Content-Encoding"); wantKept && gotEnc != enc {
+			t.Errorf("%s: Content-Encoding = %q, want kept", enc, gotEnc)
+		}
+	}
+}
 
 func TestNewSkipsEmptyRoutes(t *testing.T) {
 	p, err := New(Config{})

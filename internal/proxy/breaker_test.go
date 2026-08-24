@@ -55,11 +55,14 @@ func TestBreakerRoundTripper(t *testing.T) {
 	if err != nil || resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("first request: resp=%v err=%v", resp, err)
 	}
-	// Second request records another failure and trips the breaker.
+	resp.Body.Close()
+	// Second request records another failure and trips the breaker; it must
+	// still reach the upstream and carry the upstream status through.
 	resp, err = rt.RoundTrip(req)
-	if err != nil {
-		t.Fatalf("second request should have reached upstream: %v", err)
+	if err != nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("second request: resp=%v err=%v, want 503 from upstream", resp, err)
 	}
+	resp.Body.Close()
 	// Third request is short-circuited.
 	if _, err := rt.RoundTrip(req); err != errCircuitOpen {
 		t.Fatalf("third request err = %v, want errCircuitOpen", err)

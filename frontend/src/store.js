@@ -42,7 +42,10 @@ export const bannerText = computed(() => {
   return null;
 });
 
+let inFlight = false;
 async function refresh(silent) {
+  if (inFlight) return;
+  inFlight = true;
   if (!silent) loading.value = true;
   lastError.value = null;
   try {
@@ -54,6 +57,7 @@ async function refresh(silent) {
     lastError.value = t('err.load', { msg: err.message });
   } finally {
     loading.value = false;
+    inFlight = false;
   }
 }
 

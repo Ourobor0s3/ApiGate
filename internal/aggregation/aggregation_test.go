@@ -89,6 +89,22 @@ func TestAddQueryPreservesExisting(t *testing.T) {
 	}
 }
 
+// A NEWS_API_URL secret may carry its own ?apiKey=: the merged key must
+// replace it (one param, resolved key wins), never duplicate it.
+func TestNewsURLForBaseReplacesExistingAPIKey(t *testing.T) {
+	h := New(func(context.Context, string) string { return "resolved" },
+		WithNewsURL("https://example.com/v2/top-headlines?sources=bbc-news&apiKey=baked-in"))
+	got := h.newsURLForBase(context.Background(), h.newsURL)
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("newsURLForBase() = %q, unparseable: %v", got, err)
+	}
+	keys := u.Query()["apiKey"]
+	if len(keys) != 1 || keys[0] != "resolved" {
+		t.Errorf("newsURLForBase() = %q, want exactly one apiKey=resolved, got %v", got, keys)
+	}
+}
+
 func TestFilterRecentArticles(t *testing.T) {
 	recent := time.Now().Add(-2 * time.Hour).Format(time.RFC3339)
 	old := time.Now().Add(-72 * time.Hour).Format(time.RFC3339)
@@ -672,9 +688,10 @@ func newMemStore() *memStore {
 	return &memStore{data: map[string]newsstore.Article{}}
 }
 
-func (m *memStore) Store(_ context.Context, arts []newsstore.Article) error {
+func (m *memStore) Store(_ context.Context, arts []newsstore.Article) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	var added int64
 	for _, a := range arts {
 		if a.URL == "" {
 			continue
@@ -684,8 +701,9 @@ func (m *memStore) Store(_ context.Context, arts []newsstore.Article) error {
 		}
 		m.data[a.URL] = a
 		m.order = append(m.order, a.URL)
+		added++
 	}
-	return nil
+	return added, nil
 }
 
 func (m *memStore) All(_ context.Context) ([]newsstore.Article, error) {

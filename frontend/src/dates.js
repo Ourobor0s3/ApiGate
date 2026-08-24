@@ -12,7 +12,7 @@ export function setLocTz(tz) {
 
 // parseUTCDate parses upstream timestamps. open-meteo's naive times get 'Z'
 // appended (they are UTC); times that already carry a zone pass through.
-export function parseUTCDate(iso) {
+function parseUTCDate(iso) {
   if (/Z$|[+-]\d{2}:?\d{2}$/i.test(iso)) return new Date(iso);
   return new Date(iso + 'Z');
 }

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -60,8 +61,7 @@ func run(ctx context.Context) error {
 		logger.Info("secrets loaded from Redis", "names", names)
 	}
 
-	// getSecret resolves a setting at request time: the Redis value wins, the
-	// env var of the same name is the fallback.
+	// The Redis value wins; the env var of the same name is the fallback.
 	getSecret := func(ctx context.Context, name string) string {
 		if v, err := store.Get(ctx, name); err == nil && v != "" {
 			return v
@@ -69,9 +69,9 @@ func run(ctx context.Context) error {
 		return os.Getenv(name)
 	}
 
-	// Empty NEWS_API_URL/WEATHER_API_URL disable only the public proxy routes;
-	// the dashboard keeps its built-in upstreams and can still switch news
-	// sources via Redis secrets at poll time (see the aggregation options).
+	// Empty WEATHER_API_URL / NEWS_API_URL disable only the proxy routes;
+	// the dashboard keeps its built-in upstreams and switches sources via
+	// Redis secrets at poll time.
 	weatherAPI := os.Getenv("WEATHER_API_URL")
 	newsAPIUpstreamEnv := os.Getenv("NEWS_API_URL")
 	newsURL := envOrDefault("NEWS_API_URL", aggregation.DefaultNewsURL)
@@ -96,14 +96,14 @@ func run(ctx context.Context) error {
 		DefaultTTL:   300,
 		RouteTTLs:    map[string]int64{"/weather": 300, "/news": 60},
 		NoCachePaths: []string{"/dashboard", "/api/secrets", "/api/checks", "/api/newsquota", "/", "/healthz"},
-		// Stale-while-revalidate: serve a stale cached copy for up to 10
-		// minutes past its TTL while refreshing in the background, so a cold
-		// cache never cascades to the upstream.
+		// Serve a stale copy for up to this long past the TTL while
+		// refreshing it in the background, so a cold cache never cascades
+		// to the upstream.
 		StaleWhileRevalidate: envDurationOrDefault("CACHE_STALE_WHILE_REVALIDATE", 10*time.Minute),
 	})
 
-	// One IP resolver for both the rate limiter and the access log, so the
-	// logged client always matches the one the limits are applied against.
+	// One resolver for both rate limiting and access logging, so the logged
+	// client always matches the one the limits are applied against.
 	clientIP := clientIPResolver(logger)
 
 	rl := ratelimit.New(rdb, ratelimit.Config{
@@ -114,9 +114,7 @@ func run(ctx context.Context) error {
 		NoRateLimitPaths: []string{"/healthz"},
 	})
 
-	// newsQuota caps newsapi consumption at 100 requests/day (free plan),
-	// shared by the /news route and the background news poller. Exhaustion
-	// fires a webhook once per day when one is configured.
+	// Daily NewsAPI budget shared by the /news route and the poller.
 	newsQuota := quota.New(rdb, quota.Config{
 		Name:        "news",
 		Limit:       envInt64OrDefault("NEWS_DAILY_LIMIT", 100),
@@ -130,9 +128,8 @@ func run(ctx context.Context) error {
 		aggregation.WithNewsQuota(newsQuota),
 		aggregation.WithNewsStore(newsstore.New(rdb)),
 		aggregation.WithNewsStoreRU(newsstore.NewLang(rdb, "ru")),
-		// The weather/place/rates snapshots live in Redis too: the dashboard
-		// reads them per request and the poller refreshes them on the news
-		// cycle, so no dashboard request ever spends an upstream budget.
+		// Dashboard snapshots live in Redis too, so no dashboard request
+		// ever spends an upstream budget.
 		aggregation.WithKV(snapshotStore{rdb}),
 		aggregation.WithNewsPollInterval(func(ctx context.Context) time.Duration {
 			return interval.Parse(getSecret(ctx, "NEWS_POLL_INTERVAL"), aggregation.DefaultPollInterval)
@@ -156,8 +153,6 @@ func run(ctx context.Context) error {
 				"latencyMs": to.LatencyMs,
 				"checkedAt": to.CheckedAt,
 			}
-			// Fire-and-forget: a slow webhook endpoint must not stall the
-			// probe loop or a "check now" request.
 			go func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
@@ -182,8 +177,7 @@ func run(ctx context.Context) error {
 		{Name: "NEWS_API_URL", Default: newsURL, Env: newsAPIUpstreamEnv},
 		{Name: "NEWS_API_URL_RU", Default: newsURLRU, Env: os.Getenv("NEWS_API_URL_RU")},
 	}, secrets.WithOnChange(func(name string) {
-		// A data-affecting secret must reflect on the dashboard right away:
-		// fire one out-of-cycle refresh instead of waiting for the next poll.
+		// A data-affecting secret must be reflected on the dashboard right away.
 		if refreshOnSecret(name) {
 			agg.PollNow()
 		}
@@ -205,9 +199,8 @@ func run(ctx context.Context) error {
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		// WriteTimeout stays zero so slow-but-alive clients are never cut off;
-		// ReadHeaderTimeout, ReadTimeout and IdleTimeout still bound idle and
-		// slow connections.
+		// WriteTimeout stays 0 so slow-but-alive clients are never cut off;
+		// the other timeouts still bound idle and slow connections.
 		IdleTimeout: 60 * time.Second,
 	}
 
@@ -248,13 +241,23 @@ func noCache(next http.Handler) http.Handler {
 	})
 }
 
-// uiHandler serves the built SPA from frontend/dist (gitignored build output)
-// when present, and a stub page otherwise. The UI is not embedded anymore:
-// run `npm run build` in frontend/ before `go run` to avoid the stub.
+// uiHandler serves the built SPA from frontend/dist, or a stub page when
+// the build is missing. Only "/" may resolve to a directory (it maps to
+// index.html); otherwise http.FileServer would render directory listings
+// (e.g. for /assets/).
 func uiHandler(logger *slog.Logger) http.Handler {
 	const dir = "frontend/dist"
 	if info, err := os.Stat(dir); err == nil && info.IsDir() {
-		return http.FileServer(http.Dir(dir))
+		fs := http.FileServer(http.Dir(dir))
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/" {
+				if info, err := os.Stat(filepath.Join(dir, filepath.Clean(r.URL.Path))); err == nil && info.IsDir() {
+					http.NotFound(w, r)
+					return
+				}
+			}
+			fs.ServeHTTP(w, r)
+		})
 	}
 	logger.Warn("frontend/dist not found — UI not built (run `cd frontend && npm run build`)")
 	return http.HandlerFunc(stubHandler)
@@ -275,9 +278,8 @@ func stubHandler(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, stubPage)
 }
 
-// snapshotStore adapts *redis.Client to aggregation.Store for the dashboard's
-// weather/place/rates snapshots. A missing key surfaces as an empty value
-// (redis.Nil is the normal "not polled yet" case, not an error worth logging).
+// snapshotStore adapts *redis.Client to aggregation.Store; redis.Nil is the
+// normal "not polled yet" case and surfaces as an empty value.
 type snapshotStore struct{ rdb *redis.Client }
 
 func (s snapshotStore) Get(ctx context.Context, key string) (string, error) {
@@ -292,10 +294,8 @@ func (s snapshotStore) Set(ctx context.Context, key, value string, ttl time.Dura
 	return s.rdb.Set(ctx, key, value, ttl).Err()
 }
 
-// refreshOnSecret reports whether a changed secret invalidates served data.
-// A new location, currency, news upstream or API key must show up on the
-// dashboard immediately, so writes to these names trigger an immediate
-// background refresh; schedule-only settings pick up on their next cycle.
+// Data-affecting names trigger an immediate dashboard refresh on change;
+// schedule-only settings take effect on their next cycle.
 func refreshOnSecret(name string) bool {
 	switch name {
 	case "NEWS_API_KEY", "WEATHER_LOCATION", "MAIN_CURRENCY":
@@ -304,8 +304,7 @@ func refreshOnSecret(name string) bool {
 	return false
 }
 
-// newsQuotaHandler serves today's NewsAPI budget usage for the dashboard's
-// budget bar: the quota limiter state, not per-request metrics.
+// newsQuotaHandler serves today's budget usage for the dashboard bar.
 func newsQuotaHandler(newsQuota *quota.Limiter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
@@ -322,12 +321,11 @@ func newsQuotaHandler(newsQuota *quota.Limiter) http.Handler {
 	})
 }
 
-// warmCache issues GET requests through the full middleware chain shortly after
-// startup so cacheable routes (weather/news) serve from Redis instead of the
-// upstream on the first real visitor. Failures are logged, never fatal.
+// warmCache GETs cacheable routes through the full middleware chain shortly
+// after startup so the first real visitor hits a warm cache; failures are
+// logged, never fatal.
 func warmCache(ctx context.Context, h http.Handler, paths []string, logger *slog.Logger) {
 	client := &http.Client{Timeout: 15 * time.Second}
-	// Give the server a moment to come up before firing the warm requests.
 	select {
 	case <-ctx.Done():
 		return
@@ -350,10 +348,8 @@ func warmCache(ctx context.Context, h http.Handler, paths []string, logger *slog
 	}
 }
 
-// clientIPResolver builds the per-request client-IP resolver from the
-// TRUSTED_PROXIES env var (comma-separated CIDRs), letting X-Forwarded-For be
-// honored only when the connection comes from a trusted proxy. Without it the
-// secure default (RemoteAddr only) is used.
+// clientIPResolver honors X-Forwarded-For only from TRUSTED_PROXIES CIDRs;
+// anything else falls back to RemoteAddr so the header can't be spoofed.
 func clientIPResolver(logger *slog.Logger) func(*http.Request) string {
 	if v := os.Getenv("TRUSTED_PROXIES"); v != "" {
 		parts := strings.Split(v, ",")
@@ -363,11 +359,11 @@ func clientIPResolver(logger *slog.Logger) func(*http.Request) string {
 				proxies = append(proxies, p)
 			}
 		}
-		if resolve, err := middleware.ForwardedClientIP(proxies...); err == nil {
+		resolve, err := middleware.ForwardedClientIP(proxies...)
+		if err == nil {
 			return resolve
-		} else {
-			logger.Warn("ignoring invalid TRUSTED_PROXIES, falling back to RemoteAddr", "err", err)
 		}
+		logger.Warn("ignoring invalid TRUSTED_PROXIES, falling back to RemoteAddr", "err", err)
 	}
 	return middleware.ClientIP
 }

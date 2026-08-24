@@ -58,7 +58,7 @@ const errorMessage = computed(() => t('news.error', { msg: props.news?.message |
       </div>
       <div v-if="state === 'articles'" class="news-list">
         <article v-for="a in pageItems" :key="a.url || a.title" class="ncard">
-          <a class="ntitle" :href="a.url || '#'" target="_blank" rel="noopener">{{ a.title || t('news.untitled') }}</a>
+          <a class="ntitle" :href="a.url || '#'" target="_blank" rel="noopener noreferrer">{{ a.title || t('news.untitled') }}</a>
           <p v-if="a.description" class="ndesc">{{ a.description }}</p>
           <span class="nmeta">
             <span class="dot"></span>{{ (a.source && a.source.name) || t('news.unknownSource') }}

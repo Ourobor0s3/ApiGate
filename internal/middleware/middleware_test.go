@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"compress/gzip"
 	"io"
 	"log/slog"
 	"net/http"
@@ -142,5 +143,56 @@ func TestStatusRecorderDefaultsTo200(t *testing.T) {
 	}
 	if sr.Bytes != 2 {
 		t.Errorf("Bytes = %d, want 2", sr.Bytes)
+	}
+}
+
+// Bodiless statuses (204, 304) must never grow a Content-Encoding header.
+func TestGzipSkipsBodilessStatuses(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int
+		body []byte
+	}{
+		{"204 no content", http.StatusNoContent, nil},
+		{"304 not modified", http.StatusNotModified, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.code)
+				if len(tc.body) > 0 {
+					_, _ = w.Write(tc.body)
+				}
+			})
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Set("Accept-Encoding", "gzip")
+			Gzip(inner).ServeHTTP(rec, req)
+			if enc := rec.Header().Get("Content-Encoding"); enc != "" {
+				t.Errorf("Content-Encoding = %q for %d, want none", enc, tc.code)
+			}
+		})
+	}
+}
+
+func TestGzipCompressesJSON(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(bytes.Repeat([]byte(`{"k":1}`), 100))
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	Gzip(inner).ServeHTTP(rec, req)
+	if enc := rec.Header().Get("Content-Encoding"); enc != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", enc)
+	}
+	zr, err := gzip.NewReader(rec.Body)
+	if err != nil {
+		t.Fatalf("body is not valid gzip: %v", err)
+	}
+	got, err := io.ReadAll(zr)
+	if err != nil || len(got) == 0 {
+		t.Fatalf("gzip round-trip failed: %v (%d bytes)", err, len(got))
 	}
 }

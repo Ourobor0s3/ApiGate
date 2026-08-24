@@ -13,15 +13,12 @@ import (
 
 var validName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
-// maxSecretValue caps a stored secret (API keys, URLs, intervals are all a few
-// hundred bytes at most), so one bad write can't plant a huge value that every
-// request would then re-read into memory.
+// maxSecretValue bounds one stored secret so a bad write can't plant a huge
+// value every request would re-read.
 const maxSecretValue = 8 << 10
 
-// redactAPIKeyParam strips an apiKey query parameter from a URL-shaped value
-// before it is listed, so a key embedded in an upstream URL (e.g. a
-// NEWS_API_URL with ?apiKey=...) is never echoed back by /api/secrets.
-// Non-URL values pass through untouched.
+// redactAPIKeyParam strips an apiKey query param from URL-shaped values before
+// listing, so a key embedded in e.g. NEWS_API_URL is never echoed back.
 func redactAPIKeyParam(v string) string {
 	u, err := url.Parse(v)
 	if err != nil || u.Scheme == "" {
@@ -74,8 +71,7 @@ func (s *Store) List(ctx context.Context) ([]string, error) {
 	return names, iter.Err()
 }
 
-// storer is the narrow store surface the REST handler needs. *Store satisfies
-// it; tests substitute an in-memory fake, keeping the handler Redis-free.
+// storer is the handler's store surface; tests fake it.
 type storer interface {
 	Get(ctx context.Context, name string) (string, error)
 	Set(ctx context.Context, name, value string) error
@@ -83,10 +79,8 @@ type storer interface {
 	List(ctx context.Context) ([]string, error)
 }
 
-// Setting describes one runtime-configurable variable shown on the API
-// Secrets page: its built-in default and the env value (if set). A stored
-// Redis secret of the same name overrides both; Masked names never have their
-// value returned (api keys).
+// A stored Redis secret overrides both Default and Env; masked names never
+// have their value returned.
 type Setting struct {
 	Name    string
 	Default string
@@ -97,18 +91,14 @@ type Setting struct {
 // Option configures a Handler.
 type Option func(*Handler)
 
-// WithOnChange registers a callback fired after a secret is created or
-// deleted — never on read or on a rejected write. main uses it to trigger an
-// immediate data refresh when a data-affecting secret changes, so the
-// dashboard reflects the new location, currency or news upstream without
-// waiting for the next scheduled poll.
+// WithOnChange fires after a secret is created or deleted — main uses it to
+// refresh the dashboard when a data-affecting secret changes.
 func WithOnChange(f func(string)) Option {
 	return func(h *Handler) { h.onChange = f }
 }
 
-// Handler exposes the store as a small REST API. Values are never returned in
-// responses — only secret names are listed, plus the known settings catalog
-// (with defaults) so the UI can offer every changeable variable in one place.
+// Handler exposes the store as a small REST API. Values are never returned —
+// only names, plus the settings catalog so the UI can offer every variable.
 type Handler struct {
 	store    storer
 	settings []Setting
@@ -123,8 +113,6 @@ func NewHandler(s storer, settings []Setting, opts ...Option) *Handler {
 	return h
 }
 
-// Register wires the GET/POST/DELETE routes on /api/secrets. Method and path
-// are matched exactly by the Go 1.22+ ServeMux, so anything else gets 405/404.
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/secrets", h.list)
 	mux.HandleFunc("POST /api/secrets", h.create)

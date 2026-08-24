@@ -17,11 +17,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// ClientIP returns the client's IP from RemoteAddr. X-Forwarded-For is
-// deliberately ignored: it is client-controlled and trivially spoofable, and
-// trusting it would let anyone bypass per-IP rate limits or make their requests
-// counted against a different client. Behind a trusted reverse proxy, use
-// ForwardedClientIP instead.
+// ClientIP returns the client IP from RemoteAddr. X-Forwarded-For is
+// deliberately ignored — it is client-controlled and trusting it would let
+// anyone bypass per-IP rate limits; behind a proxy use ForwardedClientIP.
 func ClientIP(r *http.Request) string {
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return host
@@ -29,12 +27,8 @@ func ClientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-// ForwardedClientIP returns a client-IP resolver that honors X-Forwarded-For
-// only when the direct peer is one of the given trusted proxies (typically a
-// load balancer that overwrites the header). Every other peer falls back to
-// RemoteAddr, so the header can't be spoofed. Proxies are IPv4/IPv6 CIDR
-// blocks; an invalid block is reported as an error rather than silently
-// weakening the check.
+// ForwardedClientIP honors X-Forwarded-For only when the direct peer is one
+// of the given trusted proxies; every other peer falls back to RemoteAddr.
 func ForwardedClientIP(trustedProxies ...string) (func(*http.Request) string, error) {
 	blocks := make([]*net.IPNet, 0, len(trustedProxies))
 	for _, p := range trustedProxies {
@@ -107,11 +101,8 @@ func (r *StatusRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
 
-// RequestLogger logs every request with method, path, status, size, latency
-// and client IP. The query string is deliberately not logged — it may carry
-// API keys. clientIP lets the caller pass the same trusted-proxy-aware
-// resolver the rate limiter uses, so the logged IP always matches the one the
-// limits are applied against.
+// RequestLogger logs every request. The query string is deliberately not
+// logged — it may carry API keys.
 func RequestLogger(logger *slog.Logger, clientIP func(*http.Request) string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -132,8 +123,7 @@ func RequestLogger(logger *slog.Logger, clientIP func(*http.Request) string, nex
 	})
 }
 
-// Recover turns handler panics into a 500 response and logs the stack trace
-// instead of letting net/http drop the connection.
+// Recover turns handler panics into a 500 with the stack trace logged.
 func Recover(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
@@ -151,7 +141,7 @@ func Recover(logger *slog.Logger, next http.Handler) http.Handler {
 	})
 }
 
-// Health reports liveness by pinging Redis. 200 when reachable, 503 otherwise.
+// Health reports liveness by pinging Redis.
 func Health(rdb *redis.Client, logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
@@ -166,9 +156,8 @@ func Health(rdb *redis.Client, logger *slog.Logger) http.Handler {
 	})
 }
 
-// SecureHeaders sets security headers on every response and, when corsOrigin is
-// non-empty, applies CORS headers for that origin (or "*"), including preflight
-// handling. It must sit outermost so every response is covered.
+// SecureHeaders sets security headers on every response and applies CORS for
+// corsOrigin when set. Must sit outermost so every response is covered.
 func SecureHeaders(corsOrigin string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -207,8 +196,8 @@ func SecureHeaders(corsOrigin string) func(http.Handler) http.Handler {
 	}
 }
 
-// Gzip compresses responses for clients that accept gzip, skipping streaming
-// responses (SSE must stay uncompressed) and non-compressible content types.
+// Gzip compresses compressible responses for clients that accept gzip,
+// skipping HEAD and streaming responses.
 func Gzip(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !acceptsGzip(r) || r.Method == http.MethodHead {
@@ -230,9 +219,8 @@ func acceptsGzip(r *http.Request) bool {
 	return false
 }
 
-// gzipResponseWriter compresses the response body when the content type is
-// compressible. Compression is decided at the first WriteHeader, by which point
-// handlers have set Content-Type.
+// Compression is decided at the first WriteHeader, by which point handlers
+// have set Content-Type.
 type gzipResponseWriter struct {
 	http.ResponseWriter
 	gz       *gzip.Writer
@@ -241,10 +229,12 @@ type gzipResponseWriter struct {
 	status   int
 }
 
-// shouldCompress reports whether a response of the given status and
-// Content-Type is worth gzip-encoding.
 func (g *gzipResponseWriter) shouldCompress(code int) bool {
 	if code < 200 || code >= 400 {
+		return false
+	}
+	// Bodiless statuses must never grow a Content-Encoding header.
+	if code == http.StatusNoContent || code == http.StatusNotModified {
 		return false
 	}
 	if g.Header().Get("Content-Encoding") != "" {

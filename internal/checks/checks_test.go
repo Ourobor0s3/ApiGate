@@ -34,8 +34,11 @@ func TestHistoryKeyDigestFormat(t *testing.T) {
 	if historyKey("https://a.example/x") == historyKey("http://a.example/x") {
 		t.Error("scheme variants must not share a history key")
 	}
-	if historyKey("https://a.example/x") != historyKey("https://a.example/x") {
-		t.Error("historyKey not deterministic")
+	// Pinned key (prefix + digest): guards against accidental changes to the
+	// key algorithm, which would orphan every existing history ZSET on upgrade.
+	const want = "check:history:df10a3e0737a3e91a58e960aaadb39020916e52b"
+	if got := historyKey("https://a.example/x"); got != want {
+		t.Errorf("historyKey(%q) = %q, want pinned %q", "https://a.example/x", got, want)
 	}
 }
 

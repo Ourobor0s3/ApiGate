@@ -16,7 +16,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Article is a newsapi article persisted in Redis. URL is the dedup identity.
+// Article is a newsapi article; URL is the dedup identity.
 type Article struct {
 	Source      *Source `json:"source,omitempty"`
 	Author      string  `json:"author,omitempty"`
@@ -34,10 +34,8 @@ type Source struct {
 	Name string `json:"name,omitempty"`
 }
 
-// ArticleTTL is how long a stored article stays alive, measured from when it
-// was first stored, so accumulated history expires gradually. The index
-// outlives every article it points at by indexTTL, so a reachable article is
-// never orphaned by its index.
+// ArticleTTL runs from first storage so history expires gradually; the index
+// outlives every article it points at, so a reachable article is never orphaned.
 const (
 	ArticleTTL = 4 * 24 * time.Hour
 	indexTTL   = ArticleTTL + 24*time.Hour
@@ -56,15 +54,13 @@ type Store struct {
 	lang string
 }
 
-// New returns the store for the default (English) language namespace,
-// news:index:en / news:article:en:<digest>.
+// New returns the English-namespace store.
 func New(rdb *redis.Client) *Store {
 	return NewLang(rdb, "en")
 }
 
-// NewLang builds a store scoped to a language namespace, news:index:<lang> /
-// news:article:<lang>:<digest>, so English and Russian headlines never share
-// an index. An empty lang falls back to the English namespace.
+// NewLang scopes the store to a language namespace so EN and RU headlines
+// never share an index; empty lang falls back to "en".
 func NewLang(rdb *redis.Client, lang string) *Store {
 	if lang == "" {
 		lang = "en"
@@ -80,17 +76,11 @@ func (s *Store) articlePrefix() string {
 	return articlePrefix + s.lang + ":"
 }
 
-// articleID is the Redis key fragment identifying an article: a SHA-1 digest
-// of its URL, producing short, uniform keys (news:article:en:<40 hex>) instead
-// of fragmenting the keyspace by scheme/slashes. Dedup keeps working because
-// the same URL always yields the same digest.
+// articleID is a SHA-1 digest of the URL: short uniform keys, stable dedup.
 func articleID(rawurl string) string {
 	return fmt.Sprintf("%x", sha1.Sum([]byte(rawurl)))
 }
 
-// dropLegacy removes the bare "news:index" key written by earlier versions
-// once, on first sight; the language-suffixed index belongs to the English
-// store only. Deleting a missing key is a no-op, so this runs on every access.
 func (s *Store) dropLegacy(ctx context.Context) {
 	if s.lang != "en" {
 		return
@@ -98,8 +88,8 @@ func (s *Store) dropLegacy(ctx context.Context) {
 	s.rdb.Del(ctx, legacyIndex)
 }
 
-// publishedScore orders the index by publication time; articles without a
-// parseable date count as just-now so they surface at the top.
+// publishedScore orders the index by publication time; undated articles count
+// as just-now so they surface at the top.
 func publishedScore(a Article) int64 {
 	t, err := time.Parse(time.RFC3339, a.PublishedAt)
 	if err != nil {
@@ -108,11 +98,9 @@ func publishedScore(a Article) int64 {
 	return t.Unix()
 }
 
-// storeScript atomically writes a batch of articles in one round trip. A key
-// is only set when new (NX keeps the value and original TTL of an existing
-// key), and the index is touched only for newly stored articles, so overlapping
-// fetches never duplicate or rewrite history. A store that added something
-// also refreshes the index TTL by ttl + one-day margin.
+// storeScript writes a batch atomically: SET NX keeps the original value and
+// TTL of existing keys, only new articles touch the index, and any addition
+// refreshes the index TTL.
 var storeScript = redis.NewScript(`
 local index = KEYS[1]
 local prefix = ARGV[1]
@@ -133,21 +121,15 @@ end
 return added
 `)
 
-// maxArticleBytes caps a single stored article's encoded size; real newsapi
-// entries are a few KB at most. Skipping an outlier keeps one oversized
-// response from bloating Redis for the article's whole TTL.
+// maxArticleBytes keeps one oversized response from bloating Redis.
 const maxArticleBytes = 64 << 10
 
-// storedArticle couples an article ready for persistence with its dedup
-// identity and JSON blob.
 type storedArticle struct {
 	id      string
 	blob    []byte
 	article Article
 }
 
-// storableArticles selects the articles worth persisting: it drops entries
-// without a URL (no dedup identity) and any that encode beyond maxArticleBytes.
 func storableArticles(articles []Article) []storedArticle {
 	out := make([]storedArticle, 0, len(articles))
 	for _, a := range articles {
@@ -163,27 +145,26 @@ func storableArticles(articles []Article) []storedArticle {
 	return out
 }
 
-// Store adds articles without overwriting existing ones. A key already present
-// keeps its value and original TTL (SET NX); the index dedups on the URL
-// digest member, so the same article never appears twice.
-func (s *Store) Store(ctx context.Context, articles []Article) error {
+// Store adds articles without overwriting existing ones: a key already
+// present keeps its value and original TTL (SET NX), the index dedups on the
+// URL digest, so the same article never appears twice. Returns how many
+// articles were newly stored.
+func (s *Store) Store(ctx context.Context, articles []Article) (int64, error) {
 	s.dropLegacy(ctx)
 	stored := storableArticles(articles)
 	if len(stored) == 0 {
-		return nil
+		return 0, nil
 	}
 	args := []interface{}{s.articlePrefix()}
 	for _, a := range stored {
 		args = append(args, a.id, a.blob, publishedScore(a.article))
 	}
 	args = append(args, int64(ArticleTTL/time.Second), int64((indexTTL-ArticleTTL)/time.Second))
-	_, err := storeScript.Run(ctx, s.rdb, []string{s.indexKey()}, args...).Result()
-	return err
+	return storeScript.Run(ctx, s.rdb, []string{s.indexKey()}, args...).Int64()
 }
 
-// All returns every stored article, newest first, without duplicates. Index
-// members whose article key has expired are dropped lazily, so the index does
-// not grow without bound. The bare legacy index key is removed on sight.
+// All returns every stored article, newest first. Index members whose article
+// key expired are dropped lazily so the index stays bounded.
 func (s *Store) All(ctx context.Context) ([]Article, error) {
 	s.dropLegacy(ctx)
 	members, err := s.rdb.ZRevRange(ctx, s.indexKey(), 0, -1).Result()

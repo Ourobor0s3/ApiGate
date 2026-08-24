@@ -12,11 +12,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// windowScript prunes the sliding window, counts it and admits the request in
-// one atomic step, so concurrent requests from the same IP can't both read the
-// same pre-request count and slip past the limit. Returns the new count when
-// admitted, or a negative count when the limit is already reached (and the
-// attempt is not recorded, so rejected requests don't consume budget).
+// windowScript prunes the window, counts it and admits atomically; a negative
+// count means rejected (and not recorded, so 429s don't consume budget).
 var windowScript = redis.NewScript(`
 local windowStart = ARGV[1]
 local limit = tonumber(ARGV[2])
@@ -41,15 +38,11 @@ const keyPrefix = "ratelimit:"
 type Config struct {
 	Limit  int64
 	Window int64
-	// Logger receives warnings about Redis pipeline failures; nil uses
-	// slog.Default().
 	Logger *slog.Logger
-	// ClientIP resolves the request's client IP. It defaults to
-	// middleware.ClientIP; wire middleware.ForwardedClientIP here when running
-	// behind a trusted reverse proxy.
+	// ClientIP defaults to middleware.ClientIP; wire
+	// middleware.ForwardedClientIP behind a trusted proxy.
 	ClientIP func(*http.Request) string
-	// NoRateLimitPaths are exact-match paths exempt from rate limiting
-	// (e.g. "/healthz" so orchestration probes never consume budget).
+	// NoRateLimitPaths are exact-match exemptions (e.g. "/healthz").
 	NoRateLimitPaths []string
 }
 
@@ -74,10 +67,8 @@ func New(rdb *redis.Client, cfg Config) *RateLimiter {
 	return &RateLimiter{rdb: rdb, cfg: cfg, logger: logger, clientIP: clientIP}
 }
 
-// member returns a unique member for the window at now. A ZSET dedupes by
-// member, so using the raw millisecond timestamp would collapse concurrent
-// same-millisecond requests into one entry and let the limit be bypassed under
-// load; appending a monotonic sequence keeps every request in the window.
+// A ZSET dedupes by member, so a raw millisecond timestamp would collapse
+// concurrent requests into one entry; the sequence keeps every request.
 func (rl *RateLimiter) member(now int64) string {
 	return strconv.FormatInt(now, 10) + "-" + strconv.FormatUint(rl.seq.Add(1), 10)
 }
@@ -97,8 +88,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 		n, err := windowScript.Run(r.Context(), rl.rdb, []string{key},
 			windowStart, rl.cfg.Limit, now, rl.member(now), rl.cfg.Window).Int64()
 		if err != nil {
-			// Fail open: rate limiting is a courtesy, so an unreachable backend
-			// must not take the route down. Log so the dropout is visible.
+			// Fail open: an unreachable backend must not take the route down.
 			rl.logger.Warn("ratelimit: redis failed", "ip", ip, "err", err)
 			next.ServeHTTP(w, r)
 			return

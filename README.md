@@ -12,7 +12,7 @@ cd frontend && npm install && npm run build   # build the UI once
 go run ./cmd/apigate               # serves API + UI on :8080
 ```
 
-Open http://localhost:8080. The sidebar splits the UI into pages: **Overview** (weather, currency rates), **News** (EN/RU headlines + the NewsAPI budget bar; follows the UI language), **Site Checks**, **API Secrets**. The EN/RU switch in the header is remembered per browser. Without the frontend build the server serves a stub page that says so.
+Open http://localhost:8080. The sidebar splits the UI into pages: **Overview** (weather, currency rates), **News** (EN/RU headlines + the NewsAPI budget bar; follows the UI language), **Site Checks**, **API Secrets**. The EN/RU switch and the light/dark theme toggle live in the header; both choices are remembered per browser (the theme defaults to the OS setting). Without a frontend build, the server serves a stub page that says so.
 
 ## Docker
 
@@ -27,11 +27,13 @@ Open http://localhost:8083. The image is multi-stage (Node-built SPA + static Go
 
 ## API keys
 
-Only NewsAPI needs a key (free plan: 100 requests/24h). Register at https://newsapi.org and save `NEWS_API_KEY` in the 🔑 **API Secrets** page (stored in Redis, applied without a restart) or set the env var. Without a key the news card shows an error; when the shared daily budget (`NEWS_DAILY_LIMIT`, env-only) is spent, `/news` returns 429 and the news card shows an error — weather and rates keep working. The counter resets at midnight local time.
+Only NewsAPI needs a key (free plan: 100 requests/24h). Register at https://newsapi.org and save `NEWS_API_KEY` in the 🔑 **API Secrets** page (stored in Redis, applied without a restart) or set the env var. Without a key the news card shows an error; when the shared daily budget (`NEWS_DAILY_LIMIT`, env-only) is spent, `/news` returns 429 and the news card shows a budget-exhausted error — weather and rates keep working. The counter resets at midnight local time.
+
+Note on freshness: the NewsAPI free plan serves articles with roughly a one-day ingestion delay (verified: even `/everything?sortBy=publishedAt` returns pages whose newest item is ~24–27h old), so headlines are inherently day-old regardless of how often the gateway polls. The poller logs `fetched` vs `added` per cycle — `added=0` every time means the upstream page hasn't rotated.
 
 ## Runtime settings
 
-Everything below is changeable at runtime on the 🔑 **API Secrets** page (stored in Redis, applied without a restart; each also has an env fallback of the same name). Saving or clearing a data-affecting value (`NEWS_API_KEY`, `NEWS_API_URL`, `NEWS_API_URL_RU`, `WEATHER_LOCATION`, `MAIN_CURRENCY`) refreshes the dashboard immediately instead of waiting for the next poll.
+Everything below is changeable at runtime on the 🔑 **API Secrets** page (stored in Redis, applied without a restart; each also has an env fallback of the same name). Saving or clearing `NEWS_API_KEY`, `WEATHER_LOCATION` or `MAIN_CURRENCY` refreshes the dashboard immediately instead of waiting for the next poll; URL and interval settings simply take effect on their next scheduled cycle.
 
 | Setting | Default | Description |
 | --- | --- | --- |
@@ -57,7 +59,7 @@ Everything else (`PORT`, `REDIS_ADDR`, `WEBHOOK_URL`, `CORS_ORIGIN`, `TRUSTED_PR
 
 ## News history
 
-A background poller (default every 60m) pulls headlines for both languages into Redis and stores them deduplicated for 4 days; the news card pages through the history 8 items at a time, newest first. When the budget is exhausted the poller skips and the stored history keeps serving instead of an error card. The dashboard never fetches news per request.
+A background poller (default every 60m) pulls headlines for both languages into Redis and stores them deduplicated for 4 days; the news card pages through the history 8 items at a time, newest first. When the budget is exhausted the poller skips and the stored history keeps serving instead of an error card. The dashboard never fetches news per request. See the freshness note above: on the free plan the upstream itself delivers articles with a ~24h delay.
 
 ## Architecture
 

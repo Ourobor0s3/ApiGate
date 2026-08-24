@@ -1,5 +1,4 @@
-// Package notify posts lightweight JSON webhooks to a configured URL.
-// Notifications are best-effort side effects: failures are logged, never
+// Package notify posts best-effort JSON webhooks; failures are logged, never
 // returned to callers.
 package notify
 

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"syscall"
 	"time"
 )
 
@@ -14,16 +15,28 @@ import (
 // RestrictedDialContext.
 var ErrBlocked = errors.New("blocked address")
 
-// RestrictedDialContext returns a DialContext that refuses connections to
-// loopback/private/link-local addresses at dial time (SSRF guard). A
-// resolution-time check alone can be bypassed by DNS rebinding, where a name
-// answers with public addresses for the check and private addresses when the
-// connection is actually dialed; the guard runs inside Dial, so every connect
-// re-validates the freshly resolved addresses. Names that fail to resolve are
-// passed through — the fetch itself surfaces the failure.
+// RestrictedDialContext refuses connections to loopback/private/link-local
+// addresses (SSRF guard). Two layers close the DNS-rebinding window: a
+// pre-dial LookupIP fast-fails obviously private targets before any socket is
+// opened, and a Control hook re-validates each freshly resolved address the
+// dialer is about to connect to, so an independent second resolution inside
+// Dial can't slip a private endpoint through. Unresolvable names pass through.
 func RestrictedDialContext(base *net.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	if base == nil {
 		base = &net.Dialer{}
+	}
+	d := *base // copy: the caller's dialer must not gain our Control hook
+	if d.Control == nil {
+		d.Control = func(_, addr string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				return err
+			}
+			if ip := net.ParseIP(host); ip != nil && BlockedIP(ip) {
+				return ErrBlocked
+			}
+			return nil
+		}
 	}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, _, err := net.SplitHostPort(addr)
@@ -37,7 +50,7 @@ func RestrictedDialContext(base *net.Dialer) func(ctx context.Context, network, 
 				}
 			}
 		}
-		return base.DialContext(ctx, network, addr)
+		return d.DialContext(ctx, network, addr)
 	}
 }
 

@@ -1,7 +1,6 @@
 // Package checks probes user-configured URLs on a schedule and stores the
-// latest result for the dashboard. Targets live in Redis, the interval comes
-// from a per-request resolver (typically a secret), defaulting to 5 minutes.
-// Probe history lives in one ZSET per target, pruned on every write/read.
+// latest result for the dashboard. Targets live in Redis; probe history is
+// one ZSET per target, pruned on every write/read.
 package checks
 
 import (
@@ -28,47 +27,39 @@ import (
 // DefaultInterval is used when no CHECK_INTERVAL secret is set.
 const DefaultInterval = 5 * time.Minute
 
-// ErrExists and ErrInvalidURL classify Add errors for the REST handler.
 var (
 	ErrExists         = errors.New("check already exists")
 	ErrInvalidURL     = errors.New("invalid URL")
 	ErrPrivateAddress = errors.New("private address not allowed")
 )
 
-// historyLimit caps how many probe results are kept per target for uptime
-// reporting; older entries are trimmed on each probe. The latest probe result
-// is always the last entry of the history ZSET, so no separate status key is
-// kept.
+// historyLimit caps probe records per target; the latest result is always the
+// last ZSET entry, so no separate status key is kept.
 const historyLimit = 100
 
-// historyWindow is how long a probe record stays in the history; older
-// entries are pruned by score on every write/read, no background sweeper.
 const historyWindow = 48 * time.Hour
 
-// checkDrainBytes is how much of a probe response body is read before the
-// connection is closed, so keep-alive connections stay reusable without
-// transferring a huge body in full on every probe.
+// checkDrainBytes bounds how much of a probe body is read so keep-alive
+// connections stay reusable without transferring huge bodies.
 const checkDrainBytes = 64 << 10
 
 // targetsKey is a Redis SET of the URLs to probe.
 const targetsKey = "check:targets"
 
-// Config configures a Checks instance.
 type Config struct {
 	HTTPClient *http.Client
 	Logger     *slog.Logger
-	// Interval resolves the polling interval per cycle (e.g. from a
-	// CHECK_INTERVAL secret); nil means DefaultInterval.
+	// Interval resolves the polling interval each cycle (e.g. from a
+	// CHECK_INTERVAL secret).
 	Interval func(context.Context) time.Duration
-	// OnStatusChange, if set, fires whenever a target flips between healthy
-	// and failing (or vice versa), e.g. to post a webhook.
+	// OnStatusChange fires when a target flips between healthy and failing,
+	// e.g. to post a webhook.
 	OnStatusChange func(ctx context.Context, url string, from, to Status)
-	// AllowPrivate, when true, permits targets that resolve to loopback,
-	// private or link-local addresses. Off by default to prevent SSRF.
+	// AllowPrivate permits loopback/private/link-local targets; off by
+	// default to prevent SSRF.
 	AllowPrivate bool
 }
 
-// Status is the outcome of one probe.
 type Status struct {
 	OK        bool   `json:"ok"`
 	Code      int    `json:"code,omitempty"`
@@ -76,13 +67,11 @@ type Status struct {
 	CheckedAt string `json:"checkedAt,omitempty"`
 }
 
-// Item is one monitored target plus its latest status (nil until probed).
 type Item struct {
 	Name   string  `json:"name"`
 	URL    string  `json:"url"`
 	Status *Status `json:"status"`
-	// Uptime is the percentage of the last probes that succeeded (0-100).
-	Uptime float64 `json:"uptime,omitempty"`
+	Uptime float64 `json:"uptime,omitempty"` // percent of OK probes, 0-100
 }
 
 type Checks struct {
@@ -107,10 +96,9 @@ func New(rdb *redis.Client, cfg Config) *Checks {
 	return &Checks{rdb: rdb, httpClient: cfg.HTTPClient, logger: cfg.Logger, interval: cfg.Interval, onChange: cfg.OnStatusChange, allowPrivate: cfg.AllowPrivate}
 }
 
-// newCheckClient builds the probing client. Unless AllowPrivate is set, every
-// connection — including any redirect the probe follows — is validated against
-// private ranges at dial time, so an Add-time DNS check alone can't be
-// bypassed by redirecting a public URL to an internal address.
+// newCheckClient validates every connection — including redirect hops —
+// against private ranges at dial time, so an Add-time DNS check alone can't be
+// bypassed by redirecting a public URL inward.
 func newCheckClient(allowPrivate bool) *http.Client {
 	base := &net.Dialer{Timeout: 5 * time.Second}
 	transport := &http.Transport{
@@ -128,8 +116,8 @@ func newCheckClient(allowPrivate bool) *http.Client {
 	return &http.Client{Timeout: 8 * time.Second, Transport: transport}
 }
 
-// guardedDialContext wraps the shared netguard dial guard, mapping its error
-// to the API-facing ErrPrivateAddress so the REST handler classifies it.
+// guardedDialContext maps netguard.ErrBlocked to the API-facing
+// ErrPrivateAddress so the REST handler can classify it.
 func guardedDialContext(base *net.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	dial := netguard.RestrictedDialContext(base)
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -141,33 +129,21 @@ func guardedDialContext(base *net.Dialer) func(ctx context.Context, network, add
 	}
 }
 
-// historyKeyPrefix namespaces the per-target history ZSETs, which otherwise
-// share the "check:" prefix with the targets SET.
 const historyKeyPrefix = "check:history:"
 
-// historyTTL bounds how long a history key survives after its last probe, so a
-// target that stops being polled cleans itself up. Refreshed on every write,
-// it comfortably exceeds historyWindow + the longest polling interval.
 const historyTTL = 4 * 24 * time.Hour
 
-// historyKey is the per-target ZSET of probe records: each member is a Status
-// JSON blob scored by probe time (ascending, so rank order is oldest→newest).
-// The key embeds a digest of the target URL, not the URL itself, so the
-// keyspace stays uniform regardless of URL spelling.
+// historyKey embeds a URL digest so the keyspace stays uniform regardless of
+// URL spelling; each member is a Status JSON blob scored by probe time.
 func historyKey(rawurl string) string { return historyKeyPrefix + sha1hex(rawurl) }
 
-// legacyHistoryKey is the pre-digest key ("check:history:<url>") written by
-// earlier versions. It is dropped on sight so it can't accumulate.
+// legacyHistoryKey is the pre-digest key, dropped on sight.
 func legacyHistoryKey(rawurl string) string { return historyKeyPrefix + rawurl }
 
-// sha1hex digests a string into the 40-hex-char form used in history keys.
 func sha1hex(s string) string {
 	return fmt.Sprintf("%x", sha1.Sum([]byte(s)))
 }
 
-// Add registers a target and returns ErrExists for duplicates. Unless
-// AllowPrivate is set, targets resolving to loopback/private/link-local
-// addresses are rejected to prevent SSRF.
 func (c *Checks) Add(ctx context.Context, rawurl string) error {
 	if err := validateURL(rawurl); err != nil {
 		return err
@@ -187,11 +163,8 @@ func (c *Checks) Add(ctx context.Context, rawurl string) error {
 	return nil
 }
 
-// guardPublicAddress resolves the target host and rejects it when any address
-// is loopback, private or link-local. Names that fail to resolve are allowed
-// through — the probe itself will surface the failure. This is a fast-fail
-// check at registration time; the dial-time guard in newCheckClient is the
-// real enforcement (it also covers redirect targets).
+// guardPublicAddress is the Add-time fast-fail; the dial-time guard in
+// newCheckClient (which also covers redirects) is the real enforcement.
 func guardPublicAddress(ctx context.Context, rawurl string) error {
 	u, err := url.Parse(rawurl)
 	if err != nil || u.Hostname() == "" {
@@ -286,9 +259,8 @@ func isWrongType(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "WRONGTYPE")
 }
 
-// Run probes all targets on the current interval until ctx is cancelled. The
-// interval is re-read every cycle, so changing the CHECK_INTERVAL secret takes
-// effect on the next round without a restart.
+// Run probes all targets until ctx is cancelled; the interval is re-read every
+// cycle so a changed CHECK_INTERVAL secret takes effect without a restart.
 func (c *Checks) Run(ctx context.Context) {
 	interval := c.interval(ctx)
 	c.logger.Info("checks: started", "interval", interval)
@@ -308,15 +280,12 @@ func (c *Checks) Run(ctx context.Context) {
 	}
 }
 
-// CheckAll probes every target immediately and returns the fresh results, used
-// by the "check now" button.
+// CheckAll probes immediately and returns fresh results ("check now" button).
 func (c *Checks) CheckAll(ctx context.Context) ([]Item, time.Duration, error) {
 	c.checkAll(ctx)
 	return c.List(ctx)
 }
 
-// probeWorkers caps how many target probes run at once, so a large target list
-// can't open an unbounded number of connections on every cycle.
 const probeWorkers = 10
 
 func (c *Checks) checkAll(ctx context.Context) {
@@ -376,14 +345,13 @@ func (c *Checks) checkOne(ctx context.Context, rawurl string) {
 	if err != nil {
 		return
 	}
-	// One timestamp for the record and its history score: the two must never
+	// One timestamp for the record and its history score: they must never
 	// disagree (e.g. across a midnight boundary).
 	if !c.storeStatus(ctx, rawurl, b, at) {
 		return
 	}
 
-	// Fire the status-change hook only when a prior result exists and the
-	// healthy/failing state actually flipped.
+	// Fire the hook only when a prior result exists and the state flipped.
 	if c.onChange != nil {
 		prev := c.previousStatus(ctx, rawurl)
 		if prev.CheckedAt != "" && prev.OK != s.OK {
@@ -392,12 +360,9 @@ func (c *Checks) checkOne(ctx context.Context, rawurl string) {
 	}
 }
 
-// storeStatus appends one probe record to the target's history ZSET, pruning
-// records older than historyWindow, capping the history to historyLimit and
-// refreshing the key TTL. A legacy list key from the pre-ZSET format and the
-// legacy URL-keyed history key are both dropped and the write retried, so
-// existing Redis data migrates on the first probe after an upgrade.
-// Returns false when the record could not be stored.
+// storeStatus appends one record, pruning past historyWindow, capping at
+// historyLimit and refreshing the TTL. Legacy keys are dropped and the write
+// retried so old data migrates on the first probe after an upgrade.
 func (c *Checks) storeStatus(ctx context.Context, rawurl string, record []byte, at time.Time) bool {
 	write := func() error {
 		pipe := c.rdb.Pipeline()
@@ -422,8 +387,7 @@ func (c *Checks) storeStatus(ctx context.Context, rawurl string, record []byte, 
 	return true
 }
 
-// previousStatus returns the status recorded before the just-stored one (the
-// second-to-last entry of the history ZSET).
+// previousStatus reads the second-to-last history entry (before the just-stored one).
 func (c *Checks) previousStatus(ctx context.Context, rawurl string) Status {
 	members, err := c.rdb.ZRange(ctx, historyKey(rawurl), -2, -2).Result()
 	if err != nil || len(members) == 0 {
@@ -436,7 +400,6 @@ func (c *Checks) previousStatus(ctx context.Context, rawurl string) Status {
 	return Status{}
 }
 
-// uptime computes the percentage of OK probes across the stored history.
 func uptime(entries []string) float64 {
 	var ok, total int
 	for _, e := range entries {
@@ -455,7 +418,7 @@ func uptime(entries []string) float64 {
 	return float64(ok) / float64(total) * 100
 }
 
-// shortName returns the most identifying short part of a URL — its hostname.
+// shortName returns the display name: the URL's hostname.
 func shortName(rawurl string) string {
 	u, err := url.Parse(rawurl)
 	if err != nil || u.Hostname() == "" {
@@ -505,12 +468,8 @@ func (h *Handler) writeList(w http.ResponseWriter, items []Item, interval time.D
 	})
 }
 
-// runAll re-probes every target right now and returns the fresh list, backing
-// the "Check now" button. Checks run concurrently, so latency is bounded by
-// the slowest single probe.
 func (h *Handler) runAll(w http.ResponseWriter, r *http.Request) {
-	// The request context dies with the client, so use a bounded background
-	// context to let probing run to completion.
+	// The request context dies with the client; probing needs its own bound.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	items, interval, err := h.ch.CheckAll(ctx)
@@ -555,8 +514,8 @@ func (h *Handler) add(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	// Probe it right away so the section shows a status without waiting for
-	// the next interval tick, on a fresh bounded context.
+	// Probe right away on a fresh bounded context so the section shows a
+	// status without waiting for the next tick.
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

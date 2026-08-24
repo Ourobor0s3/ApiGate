@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted } from 'vue';
 import { useRoute } from 'vue-router';
 import { t, LOCALE, lang, setLang } from './i18n';
+import { theme, toggleTheme } from './theme';
 import { locTz } from './dates';
 import { status, bannerText, startAutoRefresh, stopAutoRefresh, loading, lastError, dashboard } from './store';
 import Sidebar from './components/Sidebar.vue';
@@ -58,6 +59,15 @@ onUnmounted(stopAutoRefresh);
     </div>
     <div class="topbar-right">
       <span class="badge" :class="badgeClass"><span class="dot"></span>{{ t('badge.' + status) }}</span>
+      <button type="button" class="icon-btn" :aria-label="t('theme.toggle')" :title="t('theme.toggle')" @click="toggleTheme">
+        <svg v-if="theme === 'dark'" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="4.4"/>
+          <path d="M12 2.5v2.6M12 18.9v2.6M2.5 12h2.6M18.9 12h2.6M5.3 5.3l1.8 1.8M16.9 16.9l1.8 1.8M18.7 5.3l-1.8 1.8M7.1 16.9l-1.8 1.8"/>
+        </svg>
+        <svg v-else width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path d="M20.6 14.6A8.6 8.6 0 0 1 9.4 3.4a.7.7 0 0 0-.9-.9 9.9 9.9 0 1 0 13 13 .7.7 0 0 0-.9-.9Z"/>
+        </svg>
+      </button>
       <div class="lang-switch" role="group" aria-label="Language">
         <button type="button" :class="{ active: lang === 'en' }" @click="setLang('en')">EN</button>
         <button type="button" :class="{ active: lang === 'ru' }" @click="setLang('ru')">RU</button>
